@@ -47,6 +47,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { Toaster, toast } from 'sonner';
 import { format } from 'date-fns';
+import { Analytics } from '@vercel/analytics/react';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -1602,6 +1603,7 @@ export default function App() {
         </div>
 
       </main>
+      <Analytics />
     </div>
   );
 }

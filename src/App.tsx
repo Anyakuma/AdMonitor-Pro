@@ -523,6 +523,7 @@ export default function App() {
   const [keywordStats,      setKeywordStats]       = useState<Record<string,KeywordStat>>({});
   const [micDevices,        setMicDevices]         = useState<MediaDeviceInfo[]>([]);
   const [selectedMic,       setSelectedMic]        = useState<string>('');
+  const [speechLang,        setSpeechLang]         = useState<string>('en-US');
   const [showSettings,      setShowSettings]       = useState(true);
   const [showStats,         setShowStats]          = useState(false);
   const [vadActive,         setVadActive]          = useState(false);
@@ -642,6 +643,7 @@ export default function App() {
   const rmsRef = useRef(0);
   const VAD_HYSTERESIS = 8; // frames
   const vadCounterRef = useRef(0);
+  const varianceMetricRef = useRef(0); // for adaptive VAD threshold
 
   // ── Visualiser ───────────────────────────────────────────────────────────
   const startVisualiser = useCallback(async (stream: MediaStream) => {
@@ -700,15 +702,19 @@ export default function App() {
           if (noiseCalibSamples.current.length === 90) {
             const sorted = [...noiseCalibSamples.current].sort((a,b)=>a-b);
             const floor = sorted[Math.floor(sorted.length * 0.8)]; // 80th percentile
+            const variance = sorted[Math.floor(sorted.length * 0.95)] - floor; // dynamic range indicator
             noiseFloorRef.current = floor;
+            varianceMetricRef.current = variance; // store for adaptive VAD
             setNoiseFloor(floor);
             setNoiseCalibrating(false);
-            appendDebug(`Noise floor calibrated: ${(floor*100).toFixed(1)}%`);
+            appendDebug(`Noise floor calibrated: ${(floor*100).toFixed(1)}% (range: ${(variance*100).toFixed(1)}%)`);
           }
         }
 
-        // VAD: voice detected if RMS > noiseFloor * 2.5 (adaptive)
-        const threshold = Math.max(0.04, noiseFloorRef.current * 2.5);
+        // VAD: voice detected if RMS > noiseFloor * multiplier (adaptive, more sensitive)
+        // Lower multiplier for home/office environments, higher for noisy environments
+        const adaptiveMultiplier = Math.max(1.8, Math.min(3.0, 2.0 + varianceMetricRef.current * 5));
+        const threshold = Math.max(0.01, noiseFloorRef.current * adaptiveMultiplier); // reduced min threshold
         if (rmsRef.current > threshold) {
           vadCounterRef.current = VAD_HYSTERESIS;
         } else {
@@ -840,11 +846,12 @@ export default function App() {
     } else {
       const constraints: MediaStreamConstraints = {
         audio: {
-          echoCancellation: false,
-          noiseSuppression: false,  // we do our own filtering
-          autoGainControl: false,
+          echoCancellation: true,   // helps with clarity across devices
+          noiseSuppression: true,   // improves signal-to-noise ratio
+          autoGainControl: true,    // stabilizes volume across different mic types
           channelCount: 1,
-          sampleRate: 48000,
+          sampleRate: { ideal: 48000, min: 16000 },  // fallback to lower rate if needed
+          latency: { ideal: 0.01 },
           ...(selectedMic ? { deviceId: { exact: selectedMic } } : {})
         }
       };
@@ -922,7 +929,7 @@ export default function App() {
           recog.continuous      = true;
           recog.interimResults  = true;
           recog.maxAlternatives = 8;
-          recog.lang            = 'en-US';
+          recog.lang            = speechLang;  // use selected language
           refreshGrammar(recog);
 
           recog.onresult = (event: any) => {
@@ -1365,6 +1372,35 @@ export default function App() {
                         </div>
                       </div>
                     )}
+
+                    <div>
+                      <label className="block text-xs font-medium text-zinc-400 mb-2">Speech Language</label>
+                      <div className="relative">
+                        <select value={speechLang} onChange={e=>setSpeechLang(e.target.value)}
+                          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-xl text-xs outline-none focus:border-blue-500 text-zinc-200">
+                          <option value="en-US">English (US)</option>
+                          <option value="en-GB">English (UK)</option>
+                          <option value="en-IN">English (India)</option>
+                          <option value="en-AU">English (Australia)</option>
+                          <option value="es-ES">Spanish (Spain)</option>
+                          <option value="es-MX">Spanish (Mexico)</option>
+                          <option value="fr-FR">French</option>
+                          <option value="de-DE">German</option>
+                          <option value="it-IT">Italian</option>
+                          <option value="pt-BR">Portuguese (Brazil)</option>
+                          <option value="pt-PT">Portuguese (Portugal)</option>
+                          <option value="nl-NL">Dutch</option>
+                          <option value="pl-PL">Polish</option>
+                          <option value="ru-RU">Russian</option>
+                          <option value="ja-JP">Japanese</option>
+                          <option value="ko-KR">Korean</option>
+                          <option value="zh-CN">Chinese (Simplified)</option>
+                          <option value="zh-TW">Chinese (Traditional)</option>
+                          <option value="ar-SA">Arabic</option>
+                          <option value="hi-IN">Hindi</option>
+                        </select>
+                      </div>
+                    </div>
 
                     {/* Fixed 30+30 recording window info */}
                     <div className="bg-blue-500/5 border border-blue-500/15 rounded-xl p-3 flex items-center justify-between">

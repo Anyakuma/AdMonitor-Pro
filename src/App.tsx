@@ -515,7 +515,7 @@ export default function App() {
 
   const [playingId,         setPlayingId]          = useState<string | null>(null);
   const [playProgress,      setPlayProgress]       = useState<Record<string,number>>({});
-  const [sensitivity,       setSensitivity]        = useState<number>(3);
+  const [sensitivity,       setSensitivity]        = useState<number>(4);
   const [searchQuery,       setSearchQuery]        = useState('');
   const [sortBy,            setSortBy]             = useState<'time'|'keyword'|'duration'>('time');
   const [selectedRecs,      setSelectedRecs]       = useState<Set<string>>(new Set());
@@ -851,7 +851,6 @@ export default function App() {
           autoGainControl: true,    // stabilizes volume across different mic types
           channelCount: 1,
           sampleRate: { ideal: 48000, min: 16000 },  // fallback to lower rate if needed
-          latency: { ideal: 0.01 },
           ...(selectedMic ? { deviceId: { exact: selectedMic } } : {})
         }
       };
@@ -934,9 +933,14 @@ export default function App() {
 
           recog.onresult = (event: any) => {
             if (isPausedRef.current) return;
-            // VAD gate: only process if voice is active (or VAD recently active)
-            // This prevents music-only segments from consuming recognition quota
-            if (!vadCounterRef.current && noiseFloorRef.current > 0) return;
+            // VAD gate: don't skip speech results during early listening (first few frames)
+            // Only apply strinct VAD gate if we have high confidence there's no voice
+            const isEarlyPhase = noiseFloorRef.current === 0; // Still calibrating?
+            const hasVoiceOrEarly = vadCounterRef.current > 0 || isEarlyPhase;
+            if (!hasVoiceOrEarly && noiseFloorRef.current > 0) {
+              appendDebug(`Speech skipped (no VAD activity)`);
+              return;
+            }
 
             // Build rolling N-gram window (last 4 results concatenated)
             const results = event.results;
@@ -962,7 +966,7 @@ export default function App() {
             hyps.push({ transcript: windowJoined, confidence: 0.7 });
 
             setLiveTranscript(combined.trim().slice(-150));
-            appendDebug(`Speech: "${combined.trim().slice(0,80)}"`);
+            appendDebug(`Speech: "${combined.trim().slice(0,80)}" (${hyps.length} hypotheses, ${keywordsRef.current.length} keywords)`);
 
             const result = voteOnHypotheses(
               hyps, keywordsRef.current,
@@ -970,8 +974,10 @@ export default function App() {
             );
 
             if (result.matched) {
-              appendDebug(`Match! kw="${result.keyword}" conf=${result.confidence} vote=${(result.voteScore*100).toFixed(0)}%`);
+              appendDebug(`✓ Match! kw="${result.keyword}" conf=${result.confidence} vote=${(result.voteScore*100).toFixed(0)}% variant="${result.variant}"`);
               triggerRecording(result.keyword, result.confidence, result.transcript, result.voteScore, result.variant);
+            } else if (keywordsRef.current.length > 0) {
+              appendDebug(`✗ No match (sensitivity=${sensitivityRef.current}, vad=${vadCounterRef.current})`);
             }
           };
 
@@ -1321,9 +1327,9 @@ export default function App() {
                   <h3 className="text-base font-bold mb-1">Recording</h3>
                   <p className="text-sm text-zinc-400 mb-1">Trigger: <span className="text-red-400 font-semibold">"{currentTrigRef.current}"</span></p>
                   <p className="text-[11px] text-zinc-600 mono mb-1">vote: {(currentVoteRef.current*100).toFixed(0)}% · variant: {currentVariantRef.current}</p>
-                  <p className="text-xs text-zinc-600 mb-3 line-clamp-2 max-w-[200px] italic">"{currentTransRef.current}"</p>
+                  <p className="text-xs text-zinc-600 mb-3 line-clamp-2 max-w-50 italic">"{currentTransRef.current}"</p>
                   {/* Post-trigger progress */}
-                  <div className="w-full max-w-[200px] mb-1">
+                  <div className="w-full max-w-50 mb-1">
                     <div className="flex justify-between mono text-[10px] text-zinc-600 mb-1">
                       <span>−30s</span>
                       <span className="text-red-400">TRIGGER</span>
@@ -1494,7 +1500,7 @@ export default function App() {
 
         {/* RIGHT */}
         <div className="lg:col-span-8">
-          <div className="bg-zinc-900 rounded-2xl border border-zinc-800 overflow-hidden flex flex-col min-h-[580px]">
+          <div className="bg-zinc-900 rounded-2xl border border-zinc-800 overflow-hidden flex flex-col min-h-145">
 
             <div className="p-5 border-b border-zinc-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="flex items-center gap-3">

@@ -544,7 +544,7 @@ export default function App() {
       const saved = localStorage.getItem('detectorMode');
       if (saved === 'browser' || saved === 'hybrid-preferred' || saved === 'hybrid-required') return saved;
     }
-    return 'hybrid-preferred';
+    return 'browser';  // Default to browser-only to avoid loading Vosk by default
   });
   const [voskModelUrl,      setVoskModelUrl]       = useState<string>(() => {
     if (typeof window !== 'undefined') {
@@ -1048,8 +1048,10 @@ export default function App() {
     } catch (error) {
       console.error('Vosk initialization failed', error);
       setVoskStatus('error');
-      appendDebug('Vosk initialization failed');
-      toast.error('Vosk model failed to load; using browser ASR only.');
+      const errorMsg = (error as any)?.message || 'unknown';
+      appendDebug(`Vosk failed: ${errorMsg}`);
+      // Silently fail - app continues with browser ASR only
+      // Vosk is an optional enhancement, not required for operation
     }
   }, [appendDebug, evaluateTranscriptSource, voskModelUrl]);
 
@@ -1260,7 +1262,12 @@ export default function App() {
           recognitionRef.current = recog;
         }
 
-        initVoskRecognizer(ctx.sampleRate);
+        // Only initialize Vosk if hybrid mode is enabled
+        if (detectorModeRef.current !== 'browser' && detectorModeRef.current !== 'offline') {
+          initVoskRecognizer(ctx.sampleRate).catch(err => {
+            appendDebug(`Vosk initialization failed: ${err?.message || 'unknown error'}`);
+          });
+        }
 
         setIsListening(true); isListeningRef.current = true;
         toast.success('Monitoring started. Calibrating noise floor…');

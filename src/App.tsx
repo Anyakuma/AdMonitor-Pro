@@ -42,11 +42,12 @@ import {
   Archive, StopCircle, AudioLines, Moon, Sun, Pause, Info,
   Search, CheckSquare, ChevronDown,
   BarChart2, Headphones, X, Zap, Shield, Waves,
-  RefreshCw, Eye, Filter
+  RefreshCw, Eye, Filter, Wifi, WifiOff, Bell
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Toaster, toast } from 'sonner';
 import { format } from 'date-fns';
+import * as db from './utils/db';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -547,6 +548,15 @@ export default function App() {
     return true;
   });
 
+  // ── PWA & Offline Features ────────────────────────────────────────────────
+  const [isOnline, setIsOnline] = useState(
+    typeof navigator !== 'undefined' ? navigator.onLine : true
+  );
+  const [updateAvailable, setUpdateAvailable] = useState(false);
+  const [isMobile, setIsMobile] = useState(
+    typeof window !== 'undefined' ? /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) : false
+  );
+
   // ── Refs ──────────────────────────────────────────────────────────────────
   const keywordsRef        = useRef(keywords);
   const sensitivityRef     = useRef(sensitivity);
@@ -608,6 +618,65 @@ export default function App() {
     localStorage.setItem('theme', theme);
   }, [theme]);
 
+  // ── PWA: Online/Offline monitoring ────────────────────────────────────────
+  useEffect(() => {
+    const handleOnline = () => {
+      setIsOnline(true);
+      toast.success('Back online. Syncing data...');
+      // Trigger background sync for offline recordings
+      if ('serviceWorker' in navigator && 'sync' in navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller?.postMessage({ type: 'SYNC_RECORDINGS' });
+      }
+    };
+
+    const handleOffline = () => {
+      setIsOnline(false);
+      toast.warning('You are offline. Recordings will sync when online.');
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  // ── PWA: Handle update available ──────────────────────────────────────────
+  useEffect(() => {
+    if ('serviceWorker' in navigator) {
+      const handleMessage = (event: MessageEvent) => {
+        if (event.data?.type === 'UPDATE_AVAILABLE') {
+          setUpdateAvailable(true);
+          toast('New version available!', {
+            action: {
+              label: 'Update',
+              onClick: () => {
+                if ('serviceWorker' in navigator) {
+                  navigator.serviceWorker.getRegistrations().then((registrations) => {
+                    registrations.forEach((registration) => {
+                      if (registration.waiting) {
+                        registration.waiting.postMessage({ type: 'SKIP_WAITING' });
+                      }
+                    });
+                  });
+                }
+                window.location.reload();
+              },
+            },
+          });
+        }
+      };
+
+      navigator.serviceWorker.addEventListener('message', handleMessage);
+
+      return () => {
+        navigator.serviceWorker.removeEventListener('message', handleMessage);
+      };
+    }
+  }, []);
+
   // Mic devices
   useEffect(() => {
     navigator.mediaDevices?.enumerateDevices()
@@ -649,7 +718,7 @@ export default function App() {
   const startVisualiser = useCallback(async (stream: MediaStream) => {
     try {
       if (!audioCtxRef.current)
-        audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ latencyHint:'interactive', sampleRate:48000 });
+        audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ latencyHint:'interactive', sampleRate: isMobile ? 16000 : 48000 });
       const ctx = audioCtxRef.current;
       if (ctx.state === 'suspended') await ctx.resume();
 
@@ -844,13 +913,17 @@ export default function App() {
       setLiveTranscript('');
       postTriggerRef.current = 0;
     } else {
+      // ── Mobile optimization: Adjust sample rate based on device ────
+      const preferredSampleRate = isMobile ? 16000 : 48000;
+      const fallbackSampleRate = isMobile ? 16000 : 32000;
+      
       const constraints: MediaStreamConstraints = {
         audio: {
           echoCancellation: true,   // helps with clarity across devices
           noiseSuppression: true,   // improves signal-to-noise ratio
           autoGainControl: true,    // stabilizes volume across different mic types
           channelCount: 1,
-          sampleRate: { ideal: 48000, min: 16000 },  // fallback to lower rate if needed
+          sampleRate: { ideal: preferredSampleRate, min: fallbackSampleRate },  // lower rates on mobile for CPU efficiency
           ...(selectedMic ? { deviceId: { exact: selectedMic } } : {})
         }
       };
@@ -917,7 +990,10 @@ export default function App() {
             if (rollingBufRef.current.length > 120) rollingBufRef.current.shift();
           }
         };
-        mr.start(250);
+        
+        // ── Mobile optimization: Adjust recording interval for lower CPU ────
+        const recordingInterval = isMobile ? 500 : 250;  // 500ms on mobile (2x polls/sec), 250ms on desktop (4x polls/sec)
+        mr.start(recordingInterval);
 
         // Web Speech API
         const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -1147,6 +1223,13 @@ export default function App() {
               title="Stats">
               <BarChart2 size={16} />
             </button>
+            
+            {/* ── Offline/Online Status ────────────────────────────────────── */}
+            <div className={`p-2 rounded-lg transition-colors ${!isOnline?'text-red-400':'text-emerald-400'}`}
+              title={isOnline ? 'Online & syncing' : 'Offline mode - data will sync when connection restored'}>
+              {isOnline ? <Wifi size={16} /> : <WifiOff size={16} />}
+            </div>
+
             <button onClick={()=>setTheme(t=>t==='dark'?'light':'dark')}
               className="p-2 rounded-lg hover:bg-zinc-800 text-zinc-500 transition-colors">
               {theme==='dark'?<Sun size={16}/>:<Moon size={16}/>}

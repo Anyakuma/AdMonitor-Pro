@@ -73,6 +73,8 @@ interface KeywordStat {
 }
 
 type Confidence = 'Strong' | 'Good' | 'Weak';
+type DetectorMode = 'browser' | 'hybrid-preferred' | 'hybrid-required';
+type DetectorSource = 'webspeech' | 'vosk';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ① Phoneme expansion
@@ -332,6 +334,17 @@ interface VoteResult {
   variant: string;
 }
 
+interface SourceDetection {
+  source: DetectorSource;
+  result: VoteResult;
+  at: number;
+}
+
+const strongerConfidence = (a: Confidence, b: Confidence): Confidence => {
+  const rank: Record<Confidence, number> = { Weak: 0, Good: 1, Strong: 2 };
+  return rank[a] >= rank[b] ? a : b;
+};
+
 const voteOnHypotheses = (
   hypotheses: Array<{ transcript: string; confidence?: number }>,
   keywords: string[],
@@ -495,6 +508,7 @@ const getSupportedMimeType = (): string => {
 
 const blobToBase64 = (b: Blob): Promise<string> => new Promise((res,rej)=>{const r=new FileReader();r.onloadend=()=>res(r.result as string);r.onerror=rej;r.readAsDataURL(b);});
 const base64ToBlob = async (b64: string): Promise<Blob> => { const r=await fetch(b64);return r.blob(); };
+const DEFAULT_VOSK_MODEL_URL = '/models/vosk-model-small-en-us-0.15.tar.gz';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Component
@@ -525,6 +539,21 @@ export default function App() {
   const [micDevices,        setMicDevices]         = useState<MediaDeviceInfo[]>([]);
   const [selectedMic,       setSelectedMic]        = useState<string>('');
   const [speechLang,        setSpeechLang]         = useState<string>('en-US');
+  const [detectorMode,      setDetectorMode]       = useState<DetectorMode>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('detectorMode');
+      if (saved === 'browser' || saved === 'hybrid-preferred' || saved === 'hybrid-required') return saved;
+    }
+    return 'hybrid-preferred';
+  });
+  const [voskModelUrl,      setVoskModelUrl]       = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('voskModelUrl') || ((import.meta as any).env?.VITE_VOSK_MODEL_URL ?? DEFAULT_VOSK_MODEL_URL);
+    }
+    return ((import.meta as any).env?.VITE_VOSK_MODEL_URL ?? DEFAULT_VOSK_MODEL_URL) as string;
+  });
+  const [voskStatus,        setVoskStatus]         = useState<'disabled'|'loading'|'ready'|'error'>(() => 'disabled');
+  const [voskPartial,       setVoskPartial]        = useState('');
   const [showSettings,      setShowSettings]       = useState(true);
   const [showStats,         setShowStats]          = useState(false);
   const [vadActive,         setVadActive]          = useState(false);
@@ -611,12 +640,35 @@ export default function App() {
   const recordStartRef    = useRef(0);
   const noiseCalibSamples = useRef<number[]>([]);
   const transcriptWindowRef = useRef<string[]>([]);  // rolling last-N transcripts
+  const voskTranscriptWindowRef = useRef<string[]>([]);
+  const detectorModeRef    = useRef(detectorMode);
+  const voskModelRef       = useRef<any>(null);
+  const voskRecognizerRef  = useRef<any>(null);
+  const webSpeechHitRef    = useRef<SourceDetection | null>(null);
+  const voskHitRef         = useRef<SourceDetection | null>(null);
 
   // Theme
   useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark');
     localStorage.setItem('theme', theme);
   }, [theme]);
+
+  useEffect(() => {
+    detectorModeRef.current = detectorMode;
+    localStorage.setItem('detectorMode', detectorMode);
+  }, [detectorMode]);
+
+  useEffect(() => {
+    localStorage.setItem('voskModelUrl', voskModelUrl.trim());
+    setVoskStatus('disabled');
+  }, [voskModelUrl]);
+
+  useEffect(() => {
+    return () => {
+      try { voskRecognizerRef.current?.remove?.(); } catch {}
+      try { voskModelRef.current?.terminate?.(); } catch {}
+    };
+  }, []);
 
   // ── PWA: Online/Offline monitoring ────────────────────────────────────────
   useEffect(() => {
@@ -707,6 +759,16 @@ export default function App() {
   const appendDebug = useCallback((msg: string) => {
     setDebugLog(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 60));
   }, []);
+
+  const cleanupVosk = useCallback(() => {
+    try { voskRecognizerRef.current?.remove?.(); } catch {}
+    try { voskModelRef.current?.terminate?.(); } catch {}
+    voskRecognizerRef.current = null;
+    voskModelRef.current = null;
+    voskHitRef.current = null;
+    setVoskPartial('');
+    setVoskStatus('disabled');
+  }, [voskModelUrl]);
 
   // ── Voice Activity Detection (RMS-based) ────────────────────────────────
   const rmsRef = useRef(0);
@@ -852,6 +914,8 @@ export default function App() {
       return;
     }
     cooldownRef.current.set(word, Date.now());
+    webSpeechHitRef.current = null;
+    voskHitRef.current = null;
 
     currentTrigRef.current    = word;
     currentConfRef.current    = confidence;
@@ -868,6 +932,127 @@ export default function App() {
   }, [appendDebug]);
 
   // ── Stop recording manually ───────────────────────────────────────────────
+  const maybeTriggerFromSources = useCallback((source: DetectorSource, result: VoteResult) => {
+    if (!result.matched) return;
+
+    const now = Date.now();
+    const freshWindowMs = 7000;
+    const current: SourceDetection = { source, result, at: now };
+
+    if (source === 'webspeech') webSpeechHitRef.current = current;
+    else voskHitRef.current = current;
+
+    const browserHit = webSpeechHitRef.current && now - webSpeechHitRef.current.at <= freshWindowMs
+      ? webSpeechHitRef.current
+      : null;
+    const voskHit = voskHitRef.current && now - voskHitRef.current.at <= freshWindowMs
+      ? voskHitRef.current
+      : null;
+    const hybridAvailable = voskStatus === 'ready';
+    const highConfidenceSolo = result.confidence === 'Strong' && result.voteScore >= 0.72;
+
+    if (detectorModeRef.current === 'browser' || !hybridAvailable) {
+      triggerRecording(result.keyword, result.confidence, result.transcript, result.voteScore, result.variant);
+      return;
+    }
+
+    if (browserHit && voskHit) {
+      if (browserHit.result.keyword !== voskHit.result.keyword) {
+        appendDebug(`Hybrid disagreement: browser="${browserHit.result.keyword}" vs vosk="${voskHit.result.keyword}"`);
+        return;
+      }
+
+      const mergedConfidence = strongerConfidence(browserHit.result.confidence, voskHit.result.confidence);
+      const mergedVote = Math.min(1, (browserHit.result.voteScore + voskHit.result.voteScore) / 2 + 0.12);
+      appendDebug(`Hybrid confirmed "${browserHit.result.keyword}" (${mergedConfidence}, ${(mergedVote*100).toFixed(0)}%)`);
+      triggerRecording(
+        browserHit.result.keyword,
+        mergedConfidence,
+        browserHit.result.transcript || voskHit.result.transcript,
+        mergedVote,
+        browserHit.result.variant || voskHit.result.variant
+      );
+      webSpeechHitRef.current = null;
+      voskHitRef.current = null;
+      return;
+    }
+
+    if (detectorModeRef.current === 'hybrid-required') {
+      appendDebug(`Hybrid waiting for corroboration from ${source === 'webspeech' ? 'Vosk' : 'Web Speech'}`);
+      return;
+    }
+
+    if (highConfidenceSolo) {
+      appendDebug(`Hybrid solo trigger accepted from ${source} (${(result.voteScore*100).toFixed(0)}%)`);
+      triggerRecording(result.keyword, result.confidence, result.transcript, result.voteScore, result.variant);
+    }
+  }, [appendDebug, triggerRecording, voskStatus]);
+
+  const evaluateTranscriptSource = useCallback((
+    source: DetectorSource,
+    hypotheses: Array<{ transcript: string; confidence?: number }>
+  ) => {
+    const cleaned = hypotheses.filter(h => h.transcript.trim());
+    if (!cleaned.length || !keywordsRef.current.length) return;
+
+    const result = voteOnHypotheses(
+      cleaned,
+      keywordsRef.current,
+      expandedMapRef.current,
+      sensitivityRef.current,
+      homoMapRef.current
+    );
+
+    if (result.matched) {
+      appendDebug(`${source} match "${result.keyword}" (${result.confidence}, ${(result.voteScore*100).toFixed(0)}%)`);
+      maybeTriggerFromSources(source, result);
+    }
+  }, [appendDebug, maybeTriggerFromSources]);
+
+  const initVoskRecognizer = useCallback(async (sampleRate: number) => {
+    const modelUrl = voskModelUrl.trim();
+    if (!modelUrl) {
+      setVoskStatus('disabled');
+      return;
+    }
+    if (voskRecognizerRef.current) return;
+
+    try {
+      setVoskStatus('loading');
+      appendDebug(`Loading Vosk model from ${modelUrl}`);
+      const { createModel } = await import('vosk-browser');
+      const model = await createModel(modelUrl);
+      const recognizer = new model.KaldiRecognizer(sampleRate);
+      recognizer.setWords(true);
+      recognizer.on('partialresult', (message: any) => {
+        setVoskPartial(message?.result?.partial?.trim() || '');
+      });
+      recognizer.on('result', (message: any) => {
+        const text = message?.result?.text?.trim() || '';
+        if (!text) return;
+        voskTranscriptWindowRef.current.push(text);
+        if (voskTranscriptWindowRef.current.length > 4) voskTranscriptWindowRef.current.shift();
+        evaluateTranscriptSource('vosk', [
+          { transcript: text, confidence: 0.88 },
+          { transcript: voskTranscriptWindowRef.current.join(' '), confidence: 0.7 },
+        ]);
+      });
+      recognizer.on('error', (message: any) => {
+        appendDebug(`Vosk error: ${message?.error || 'unknown'}`);
+        setVoskStatus('error');
+      });
+      voskModelRef.current = model;
+      voskRecognizerRef.current = recognizer;
+      setVoskStatus('ready');
+      appendDebug('Vosk recognizer ready');
+    } catch (error) {
+      console.error('Vosk initialization failed', error);
+      setVoskStatus('error');
+      appendDebug('Vosk initialization failed');
+      toast.error('Vosk model failed to load; using browser ASR only.');
+    }
+  }, [appendDebug, evaluateTranscriptSource, voskModelUrl]);
+
   const stopRecording = useCallback(() => {
     if (!isRecordingRef.current) return;
     postTriggerRef.current = 0;
@@ -904,6 +1089,7 @@ export default function App() {
       continuousRecRef.current?.stop();
       processorRef.current?.disconnect();
       streamRef.current?.getTracks().forEach(t => t.stop());
+      cleanupVosk();
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
       analyserRef.current = null;
       setIsListening(false); isListeningRef.current = false;
@@ -961,6 +1147,13 @@ export default function App() {
             const bl = buf.length;
             if (h + l <= bl) { buf.set(inp, h); writeHeadRef.current = h + l; }
             else { const f=bl-h; buf.set(inp.subarray(0,f),h); buf.set(inp.subarray(f),0); writeHeadRef.current=l-f; }
+            if (voskRecognizerRef.current) {
+              try {
+                voskRecognizerRef.current.acceptWaveformFloat(new Float32Array(inp), ctx.sampleRate);
+              } catch (error) {
+                console.warn('Vosk waveform accept failed', error);
+              }
+            }
           };
           processorRef.current = proc;
         } catch(e) { console.warn('ScriptProcessor unavailable', e); }
@@ -1051,7 +1244,7 @@ export default function App() {
 
             if (result.matched) {
               appendDebug(`✓ Match! kw="${result.keyword}" conf=${result.confidence} vote=${(result.voteScore*100).toFixed(0)}% variant="${result.variant}"`);
-              triggerRecording(result.keyword, result.confidence, result.transcript, result.voteScore, result.variant);
+              maybeTriggerFromSources('webspeech', result);
             } else if (keywordsRef.current.length > 0) {
               appendDebug(`✗ No match (sensitivity=${sensitivityRef.current}, vad=${vadCounterRef.current})`);
             }
@@ -1066,6 +1259,8 @@ export default function App() {
           recog.start();
           recognitionRef.current = recog;
         }
+
+        initVoskRecognizer(ctx.sampleRate);
 
         setIsListening(true); isListeningRef.current = true;
         toast.success('Monitoring started. Calibrating noise floor…');
@@ -1108,7 +1303,7 @@ export default function App() {
         }
       });
     }
-  }, [selectedMic, startVisualiser, saveRecording, triggerRecording, refreshGrammar, appendDebug]);
+  }, [selectedMic, startVisualiser, saveRecording, triggerRecording, refreshGrammar, appendDebug, cleanupVosk, evaluateTranscriptSource, initVoskRecognizer]);
 
   // ── Keyword management ────────────────────────────────────────────────────
   const addKeyword = async (e: React.FormEvent) => {
@@ -1499,7 +1694,7 @@ export default function App() {
                           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-xl text-xs outline-none focus:border-blue-500 text-zinc-200">
                           <option value="en-US">English (US)</option>
                           <option value="en-GB">English (UK)</option>
-                          <option value="en-IN">English (India)</option>
+                          <option value="en-IN">English (Nigeria)</option>
                           <option value="en-AU">English (Australia)</option>
                           <option value="es-ES">Spanish (Spain)</option>
                           <option value="es-MX">Spanish (Mexico)</option>
@@ -1519,6 +1714,41 @@ export default function App() {
                           <option value="hi-IN">Hindi</option>
                         </select>
                       </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-zinc-400 mb-2">Trigger Mode</label>
+                      <select value={detectorMode} onChange={e=>setDetectorMode(e.target.value as DetectorMode)}
+                        className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-xl text-xs outline-none focus:border-blue-500 text-zinc-200">
+                        <option value="browser">Browser ASR only</option>
+                        <option value="hybrid-preferred">Hybrid preferred</option>
+                        <option value="hybrid-required">Hybrid required</option>
+                      </select>
+                      <p className="mt-1 text-[10px] text-zinc-600">
+                        `Hybrid preferred` accepts strong solo matches but favors agreement between Web Speech and Vosk.
+                      </p>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-zinc-400 mb-2">Offline Vosk Model URL</label>
+                      <input
+                        type="text"
+                        value={voskModelUrl}
+                        onChange={e=>setVoskModelUrl(e.target.value)}
+                        placeholder="/models/vosk-model-small-en-us.tar.gz"
+                        className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-xs outline-none focus:border-blue-500 text-zinc-100 placeholder-zinc-600"
+                      />
+                      <div className="mt-2 flex items-center justify-between text-[10px] mono">
+                        <span className="text-zinc-600">Status</span>
+                        <span className={voskStatus === 'ready' ? 'text-emerald-500' : voskStatus === 'loading' ? 'text-amber-400' : voskStatus === 'error' ? 'text-red-400' : 'text-zinc-600'}>
+                          {voskStatus}
+                        </span>
+                      </div>
+                      {voskPartial && (
+                        <p className="mt-1 text-[10px] text-zinc-500 truncate" title={voskPartial}>
+                          Vosk: {voskPartial}
+                        </p>
+                      )}
                     </div>
 
                     {/* Fixed 30+30 recording window info */}
@@ -1582,6 +1812,8 @@ export default function App() {
                       {[
                         ['Voice filter', filterEnabled ? '280–3800 Hz bandpass' : 'Disabled', filterEnabled],
                         ['VAD gate', 'Adaptive RMS threshold', true],
+                        ['Detector mode', detectorMode, true],
+                        ['Secondary ASR', voskModelUrl ? `Vosk ${voskStatus}` : 'Not configured', voskStatus === 'ready' || !voskModelUrl],
                         ['Phoneme expansion', keywords.length ? `${[...expandedMapRef.current.values()].reduce((s,a)=>s+a.length,0)} variants` : 'Add keywords', true],
                         ['Multi-hypothesis', '8 alternatives + vote', true],
                         ['Soundex + Metaphone', 'Dual phonetic matching', true],

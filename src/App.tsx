@@ -1072,10 +1072,40 @@ export default function App() {
 
       }).catch((err: any) => {
         let msg = 'Could not access microphone.';
-        if (err.name==='NotAllowedError') msg='Microphone permission denied.';
-        else if (err.name==='NotFoundError') msg='No microphone found.';
-        else if (err.name==='NotReadableError') msg='Microphone in use by another app.';
-        setError(msg); toast.error(msg);
+        let helpText = '';
+        
+        if (err.name==='NotAllowedError') {
+          msg = 'Microphone permission denied.';
+          if (isMobile) {
+            helpText = '📱 On Android:\n1. When Chrome asks for permission (top of screen), tap [Allow]\n\n2. Or manually: Settings → Apps → Chrome → Permissions → Microphone → Allow';
+          } else {
+            helpText = '🔒 Click the lock icon next to the URL and select "Allow" for microphone';
+          }
+        }
+        else if (err.name==='NotFoundError') {
+          msg = 'No microphone found. Please connect a microphone and try again.';
+        }
+        else if (err.name==='NotReadableError') {
+          msg = 'Microphone is being used by another app. Close the other app and try again.';
+        }
+        else if (err.name==='SecurityError') {
+          msg = 'Browser microphone access requires HTTPS (secure connection).';
+        }
+        
+        setError(msg);
+        toast.error(msg);
+        
+        if (helpText) {
+          setTimeout(() => {
+            toast.info(
+              <div className="text-sm max-w-xs">
+                <p className="font-semibold mb-2">Permission Help:</p>
+                <p className="whitespace-pre-wrap text-xs leading-relaxed">{helpText}</p>
+              </div>,
+              { duration: 10000 }
+            );
+          }, 500);
+        }
       });
     }
   }, [selectedMic, startVisualiser, saveRecording, triggerRecording, refreshGrammar, appendDebug]);

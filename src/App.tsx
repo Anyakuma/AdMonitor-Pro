@@ -779,10 +779,25 @@ export default function App() {
   // ── Visualiser ───────────────────────────────────────────────────────────
   const startVisualiser = useCallback(async (stream: MediaStream) => {
     try {
-      if (!audioCtxRef.current)
-        audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ latencyHint:'interactive', sampleRate: isMobile ? 16000 : 48000 });
+      if (!audioCtxRef.current) {
+        try {
+          audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ 
+            latencyHint: 'interactive', 
+            sampleRate: isMobile ? 16000 : 48000 
+          });
+        } catch (e) {
+          // Fallback: let the browser choose sample rate
+          audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ 
+            latencyHint: 'interactive' 
+          });
+          appendDebug(`AudioContext created with auto sample rate: ${audioCtxRef.current!.sampleRate}Hz`);
+        }
+      }
       const ctx = audioCtxRef.current;
-      if (ctx.state === 'suspended') await ctx.resume();
+      if (ctx.state === 'suspended') {
+        await ctx.resume();
+        appendDebug('AudioContext resumed');
+      }
 
       const src = ctx.createMediaStreamSource(stream);
 
@@ -1205,11 +1220,14 @@ export default function App() {
           recog.onresult = (event: any) => {
             if (isPausedRef.current) return;
             // VAD gate: don't skip speech results during early listening (first few frames)
-            // Only apply strinct VAD gate if we have high confidence there's no voice
-            const isEarlyPhase = noiseFloorRef.current === 0; // Still calibrating?
-            const hasVoiceOrEarly = vadCounterRef.current > 0 || isEarlyPhase;
-            if (!hasVoiceOrEarly && noiseFloorRef.current > 0) {
-              appendDebug(`Speech skipped (no VAD activity)`);
+            // Only apply strict VAD gate if we have high confidence there's no voice
+            const isCalibrating = noiseFloorRef.current === 0; // Still calibrating?
+            const hasVoiceOrCalibrating = vadCounterRef.current > 0 || isCalibrating;
+            
+            // Only skip if: we're done calibrating AND we have reliable VAD AND there's no voice detected
+            const shouldSkipForVAD = !isCalibrating && noiseFloorRef.current > 0.05 && !hasVoiceOrCalibrating && varianceMetricRef.current > 0.2;
+            if (shouldSkipForVAD) {
+              appendDebug(`Speech skipped (low RMS: ${(rmsRef.current*100).toFixed(1)}% vs threshold ${(Math.max(0.01, noiseFloorRef.current * 2.5)*100).toFixed(1)}%)`);
               return;
             }
 
@@ -1635,16 +1653,16 @@ export default function App() {
             <AnimatePresence>
               {isRecording && (
                 <motion.div initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}}
-                  className="absolute inset-0 bg-zinc-900/97 flex flex-col items-center justify-center p-6 text-center border-2 border-red-500/60 rounded-2xl z-10">
-                  <div className="w-16 h-16 bg-red-500/10 border border-red-500/30 rounded-full flex items-center justify-center mb-3 animate-pulse">
-                    <Mic size={28} className="text-red-400" />
+                  className="absolute inset-0 bg-zinc-900/97 flex flex-col items-center justify-center p-4 sm:p-6 text-center border-2 border-red-500/60 rounded-2xl z-10 overflow-y-auto">
+                  <div className="w-12 h-12 sm:w-16 sm:h-16 bg-red-500/10 border border-red-500/30 rounded-full flex items-center justify-center mb-3 animate-pulse">
+                    <Mic size={isMobile ? 20 : 28} className="text-red-400" />
                   </div>
                   <h3 className="text-base font-bold mb-1">Recording</h3>
-                  <p className="text-sm text-zinc-400 mb-1">Trigger: <span className="text-red-400 font-semibold">"{currentTrigRef.current}"</span></p>
-                  <p className="text-[11px] text-zinc-600 mono mb-1">vote: {(currentVoteRef.current*100).toFixed(0)}% · variant: {currentVariantRef.current}</p>
-                  <p className="text-xs text-zinc-600 mb-3 line-clamp-2 max-w-50 italic">"{currentTransRef.current}"</p>
+                  <p className="text-xs sm:text-sm text-zinc-400 mb-1 break-words max-w-[90%]">Trigger: <span className="text-red-400 font-semibold">"{currentTrigRef.current}"</span></p>
+                  <p className="text-[10px] sm:text-[11px] text-zinc-600 mono mb-1">vote: {(currentVoteRef.current*100).toFixed(0)}% · variant: {currentVariantRef.current}</p>
+                  <p className="text-xs text-zinc-600 mb-3 line-clamp-2 max-w-[85%] italic break-words">"{currentTransRef.current}"</p>
                   {/* Post-trigger progress */}
-                  <div className="w-full max-w-50 mb-1">
+                  <div className="w-full max-w-xs mb-1 px-2">
                     <div className="flex justify-between mono text-[10px] text-zinc-600 mb-1">
                       <span>−30s</span>
                       <span className="text-red-400">TRIGGER</span>
@@ -1658,7 +1676,7 @@ export default function App() {
                     </div>
                   </div>
                   <p className="mono text-[10px] text-zinc-600 mb-4">Capturing 30s post-trigger…</p>
-                  <button onClick={stopRecording} className="px-5 py-2 bg-zinc-100 text-zinc-900 rounded-full text-sm font-semibold hover:bg-white transition-colors">
+                  <button onClick={stopRecording} className="px-4 sm:px-5 py-2 bg-zinc-100 text-zinc-900 rounded-full text-xs sm:text-sm font-semibold hover:bg-white transition-colors">
                     Stop & Save Early
                   </button>
                 </motion.div>
@@ -1852,7 +1870,7 @@ export default function App() {
 
         {/* RIGHT */}
         <div className="lg:col-span-8">
-          <div className="bg-zinc-900 rounded-2xl border border-zinc-800 overflow-hidden flex flex-col min-h-145">
+          <div className="bg-zinc-900 rounded-2xl border border-zinc-800 overflow-hidden flex flex-col min-h-[600px] md:min-h-[800px] lg:min-h-[900px]">
 
             <div className="p-5 border-b border-zinc-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="flex items-center gap-3">
@@ -1919,8 +1937,8 @@ export default function App() {
                     {filteredRecs.map(rec => (
                       <motion.div key={rec.id} layout
                         initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} exit={{opacity:0,scale:0.97}}
-                        className={`group bg-zinc-900 border ${selectedRecs.has(rec.id)?'border-blue-500/40':'border-zinc-800 hover:border-zinc-700'} rounded-xl p-4 transition-colors`}>
-                        <div className="flex items-center gap-3">
+                        className={`group bg-zinc-900 border ${selectedRecs.has(rec.id)?'border-blue-500/40':'border-zinc-800 hover:border-zinc-700'} rounded-xl p-3 sm:p-4 transition-colors`}>
+                        <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3">
                           <button onClick={()=>toggleSel(rec.id)} className="text-zinc-700 hover:text-blue-500 shrink-0 transition-colors">
                             {selectedRecs.has(rec.id) ? <CheckSquare size={16} className="text-blue-500"/> : <SquareIcon size={16}/>}
                           </button>
@@ -1932,35 +1950,29 @@ export default function App() {
                               if(playingId===rec.id){el.pause();setPlayingId(null);}
                               else{document.querySelectorAll('audio').forEach(a=>a.pause());el.currentTime=0;el.play();setPlayingId(rec.id);}
                             }}
-                            className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 transition-colors ${
+                            className={`w-9 h-9 sm:w-10 sm:h-10 rounded-full flex items-center justify-center shrink-0 transition-colors ${
                               playingId===rec.id?'bg-blue-600 text-white':'bg-zinc-800 border border-zinc-700 text-zinc-400 hover:border-blue-500/50 hover:text-blue-400'
                             }`}>
                             {playingId===rec.id ? <SquareIcon size={13} className="fill-current"/> : <Play size={15} className="ml-0.5 fill-current"/>}
                           </button>
 
-                          <div className="flex-1 min-w-0">
+                          <div className="flex-1 min-w-0 w-full">
                             <div className="flex items-center gap-2 mb-1 flex-wrap">
-                              <span className="text-sm font-semibold text-blue-400">"{rec.triggerWord}"</span>
-                              <span className={`text-[10px] px-1.5 py-0.5 rounded font-semibold ${confColor(rec.confidence)}`}>{rec.confidence}</span>
+                              <span className="text-sm font-semibold text-blue-400 truncate">{rec.triggerWord}</span>
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded font-semibold whitespace-nowrap ${confColor(rec.confidence)}`}>{rec.confidence}</span>
                               {rec.voteScore > 0 && (
-                                <span className="mono text-[10px] text-zinc-600">{(rec.voteScore*100).toFixed(0)}% votes</span>
-                              )}
-                              {rec.matchVariant && rec.matchVariant !== rec.triggerWord && (
-                                <span className="mono text-[10px] text-zinc-700 bg-zinc-800 px-1.5 py-0.5 rounded border border-zinc-700">{rec.matchVariant}</span>
+                                <span className="mono text-[10px] text-zinc-600 whitespace-nowrap">{(rec.voteScore*100).toFixed(0)}%</span>
                               )}
                             </div>
-                            {rec.transcript && <p className="text-xs text-zinc-600 truncate mb-1 italic">"{rec.transcript}"</p>}
-                            <div className="flex flex-wrap gap-3 text-xs text-zinc-600">
-                              <span className="flex items-center gap-1"><Clock size={11}/>{format(rec.timestamp,'MMM d, h:mm a')}</span>
-                              <span className="flex items-center gap-1 text-zinc-500" title="30s pre-trigger + post-trigger"><Activity size={11}/>
-                                <span className="mono">−30s</span>
-                                <span className="text-zinc-700 mx-0.5">|</span>
-                                <span className="text-red-500/70 mono text-[10px]">▲</span>
-                                <span className="text-zinc-700 mx-0.5">|</span>
-                                <span className="mono">+{Math.max(0, rec.duration - 30).toFixed(0)}s</span>
-                                <span className="text-zinc-700 ml-1">({rec.duration.toFixed(0)}s total)</span>
+                            {rec.transcript && <p className="text-xs text-zinc-600 truncate mb-1 italic">{rec.transcript}</p>}
+                            <div className="flex flex-col sm:flex-row flex-wrap gap-2 sm:gap-3 text-xs text-zinc-600">
+                              <span className="flex items-center gap-1 whitespace-nowrap"><Clock size={11}/>{format(rec.timestamp,'MMM d, h:mm a')}</span>
+                              <span className="flex items-center gap-1 text-zinc-500 whitespace-nowrap" title="30s pre-trigger + post-trigger"><Activity size={11}/>
+                                <span className="mono text-[9px]">30s pre</span>
+                                <span className="text-red-500/70 mono">▲</span>
+                                <span className="mono text-[9px]">+{Math.max(0, rec.duration - 30).toFixed(0)}s</span>
                               </span>
-                              <span className="flex items-center gap-1"><AudioLines size={11}/>{(rec.blob.size/1024).toFixed(0)} KB</span>
+                              <span className="flex items-center gap-1 whitespace-nowrap"><AudioLines size={11}/>{(rec.blob.size/1024).toFixed(0)}KB</span>
                             </div>
                             {playingId===rec.id && (
                               <div className="mt-2 h-0.5 bg-zinc-800 rounded-full overflow-hidden">
@@ -1969,7 +1981,7 @@ export default function App() {
                             )}
                           </div>
 
-                          <div className="flex items-center gap-1 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
+                          <div className="flex items-center gap-1 self-center opacity-100 transition-opacity">
                             <button
                               onClick={()=>{const u=URL.createObjectURL(rec.blob);const a=document.createElement('a');a.href=u;a.download=`ad_${rec.triggerWord}_${rec.id}.wav`;document.body.appendChild(a);a.click();document.body.removeChild(a);setTimeout(()=>URL.revokeObjectURL(u),1000);}}
                               className="p-2 text-zinc-600 hover:text-blue-400 hover:bg-blue-500/10 rounded-lg transition-colors" title="Download">

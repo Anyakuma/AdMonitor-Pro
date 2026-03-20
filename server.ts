@@ -31,7 +31,10 @@ async function initializeDatabase() {
         timestamp TEXT NOT NULL,
         audioBase64 TEXT NOT NULL,
         size INTEGER NOT NULL,
-        confidence TEXT DEFAULT 'Strong'
+        confidence TEXT DEFAULT 'Strong',
+        transcript TEXT,
+        voteScore REAL,
+        matchVariant TEXT
       );
     `);
 
@@ -104,7 +107,7 @@ async function startServer() {
   app.get("/api/recordings", async (req, res) => {
     try {
       const result = await pool.query(
-        "SELECT id, triggerWord, duration, timestamp, audioBase64, size, confidence FROM recordings ORDER BY timestamp DESC"
+        "SELECT id, triggerWord, duration, timestamp, audioBase64, size, confidence, transcript, voteScore, matchVariant FROM recordings ORDER BY timestamp DESC"
       );
       res.json(result.rows);
     } catch (err) {
@@ -115,10 +118,22 @@ async function startServer() {
 
   app.post("/api/recordings", async (req, res) => {
     try {
-      const { id, triggerWord, duration, timestamp, audioBase64, size, confidence } = req.body;
+      const { id, triggerWord, duration, timestamp, audioBase64, size, confidence, transcript, voteScore, matchVariant } = req.body;
+      // Try to add columns if they don't exist (for backward compatibility)
+      try {
+        await pool.query(`
+          ALTER TABLE recordings 
+          ADD COLUMN IF NOT EXISTS transcript TEXT,
+          ADD COLUMN IF NOT EXISTS voteScore REAL,
+          ADD COLUMN IF NOT EXISTS matchVariant TEXT;
+        `);
+      } catch (e) {
+        // Columns might already exist, ignore
+      }
+      
       await pool.query(
-        "INSERT INTO recordings (id, triggerWord, duration, timestamp, audioBase64, size, confidence) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        [id, triggerWord, duration, timestamp, audioBase64, size, confidence || 'Strong']
+        "INSERT INTO recordings (id, triggerWord, duration, timestamp, audioBase64, size, confidence, transcript, voteScore, matchVariant) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        [id, triggerWord, duration, timestamp, audioBase64, size, confidence || 'Strong', transcript || '', voteScore || 0, matchVariant || '']
       );
       res.json({ success: true });
     } catch (err) {

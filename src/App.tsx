@@ -75,6 +75,7 @@ interface KeywordStat {
 type Confidence = 'Strong' | 'Good' | 'Weak';
 type DetectorMode = 'browser' | 'hybrid-preferred' | 'hybrid-required';
 type DetectorSource = 'webspeech' | 'vosk';
+type StoredRecording = Omit<Recording, 'url' | 'timestamp'> & { timestamp: string };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ① Phoneme expansion
@@ -509,6 +510,38 @@ const getSupportedMimeType = (): string => {
 const blobToBase64 = (b: Blob): Promise<string> => new Promise((res,rej)=>{const r=new FileReader();r.onloadend=()=>res(r.result as string);r.onerror=rej;r.readAsDataURL(b);});
 const base64ToBlob = async (b64: string): Promise<Blob> => { const r=await fetch(b64);return r.blob(); };
 const DEFAULT_VOSK_MODEL_URL = '/models/vosk-model-small-en-us-0.15.tar.gz';
+const toStoredRecording = (recording: Recording): StoredRecording => ({
+  ...recording,
+  timestamp: recording.timestamp.toISOString(),
+});
+const hydrateStoredRecordings = (items: StoredRecording[]): Recording[] =>
+  items.map((item) => ({
+    ...item,
+    url: URL.createObjectURL(item.blob),
+    timestamp: new Date(item.timestamp),
+  }));
+const buildKeywordStats = (items: Recording[]): Record<string, KeywordStat> => {
+  const stats: Record<string, KeywordStat> = {};
+
+  for (const item of items) {
+    const confidenceScore = item.confidence === 'Strong' ? 1 : item.confidence === 'Good' ? 0.67 : 0.33;
+    const existing = stats[item.triggerWord] || {
+      word: item.triggerWord,
+      count: 0,
+      avgConfidence: 0,
+      lastSeen: undefined,
+    };
+    const nextCount = existing.count + 1;
+    stats[item.triggerWord] = {
+      word: item.triggerWord,
+      count: nextCount,
+      lastSeen: !existing.lastSeen || item.timestamp > existing.lastSeen ? item.timestamp : existing.lastSeen,
+      avgConfidence: ((existing.avgConfidence * existing.count) + confidenceScore) / nextCount,
+    };
+  }
+
+  return stats;
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Component
@@ -757,10 +790,31 @@ export default function App() {
 
   // Backend sync
   useEffect(() => {
+    let cancelled = false;
+
     (async () => {
       try {
+        const cachedKeywords = await db.getCachedKeywords();
+        if (!cancelled && cachedKeywords.length) {
+          setKeywords(cachedKeywords.map((item) => item.word));
+        }
+
+        const cachedRecordings = hydrateStoredRecordings(
+          await db.getAll<StoredRecording>(db.STORES.RECORDINGS)
+        );
+        if (!cancelled && cachedRecordings.length) {
+          setRecordings(cachedRecordings);
+          setKeywordStats(buildKeywordStats(cachedRecordings));
+        }
+      } catch {}
+
+      try {
         const [kw,rec] = await Promise.all([fetch('/api/keywords'),fetch('/api/recordings')]);
-        if (kw.ok) setKeywords(await kw.json());
+        if (kw.ok) {
+          const nextKeywords = await kw.json();
+          if (!cancelled) setKeywords(nextKeywords);
+          await db.cacheKeywords(nextKeywords.map((word: string, index: number) => ({ id: index + 1, word })));
+        }
         if (rec.ok) {
           const data = await rec.json();
           const parsed: Recording[] = await Promise.all(data.map(async (r: any) => {
@@ -769,10 +823,24 @@ export default function App() {
               triggerWord:r.triggerWord, duration:r.duration, confidence:r.confidence||'Strong',
               transcript:r.transcript||'', voteScore:r.voteScore||0, matchVariant:r.matchVariant };
           }));
-          setRecordings(parsed);
+          if (!cancelled) {
+            setRecordings((prev) => {
+              prev.forEach((item) => URL.revokeObjectURL(item.url));
+              return parsed;
+            });
+            setKeywordStats(buildKeywordStats(parsed));
+          }
+          await db.clear(db.STORES.RECORDINGS);
+          for (const item of parsed) {
+            await db.put(db.STORES.RECORDINGS, toStoredRecording(item));
+          }
         }
       } catch {}
     })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const appendDebug = useCallback((msg: string) => {
@@ -920,6 +988,9 @@ export default function App() {
       timestamp: new Date(), triggerWord, duration: durationSec, confidence, transcript, voteScore, matchVariant: variant
     };
     setRecordings(prev => [rec, ...prev]);
+    try {
+      await db.put(db.STORES.RECORDINGS, toStoredRecording(rec));
+    } catch {}
     setKeywordStats(prev => {
       const ex = prev[triggerWord] || { word:triggerWord, count:0, avgConfidence:0 };
       const newCount = ex.count + 1;
@@ -932,7 +1003,12 @@ export default function App() {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ id:rec.id, triggerWord, duration:durationSec, timestamp:rec.timestamp.toISOString(), audioBase64:b64, size:finalBlob.size, confidence, transcript, voteScore, matchVariant:variant })
       });
-    } catch { toast.warning('Saved locally; cloud sync unavailable.'); }
+    } catch {
+      try {
+        await db.queueRecordingForSync({ id:rec.id, triggerWord, duration:durationSec, timestamp:rec.timestamp.toISOString(), audioBase64:await blobToBase64(finalBlob), size:finalBlob.size, confidence, transcript, voteScore, matchVariant:variant });
+      } catch {}
+      toast.warning('Saved locally; cloud sync unavailable.');
+    }
   }, []);
 
   // ── Trigger detection ────────────────────────────────────────────────────
@@ -1357,6 +1433,9 @@ export default function App() {
     if (keywords.includes(word)) { toast.error('Already exists'); return; }
     setKeywords(prev => [...prev, word]);
     setNewKeyword('');
+    try {
+      await db.cacheKeywords([...keywords, word].map((value, index) => ({ id: index + 1, word: value })));
+    } catch {}
     const variants = expandKeyword(word);
     const homos = getHomophones(word);
     appendDebug(`Added "${word}" → ${variants.length} phonetic variants, ${homos.length} homophones`);
@@ -1365,7 +1444,11 @@ export default function App() {
   };
 
   const removeKeyword = async (word: string) => {
-    setKeywords(prev => prev.filter(k => k !== word));
+    const nextKeywords = keywords.filter(k => k !== word);
+    setKeywords(nextKeywords);
+    try {
+      await db.cacheKeywords(nextKeywords.map((value, index) => ({ id: index + 1, word: value })));
+    } catch {}
     toast.info(`"${word}" removed`);
     try { await fetch(`/api/keywords/${encodeURIComponent(word)}`,{method:'DELETE'}); } catch {}
   };
@@ -1373,14 +1456,20 @@ export default function App() {
   // ── Recording management ──────────────────────────────────────────────────
   const deleteRecording = async (id: string) => {
     setRecordings(prev => { const r=prev.find(r=>r.id===id); if(r) URL.revokeObjectURL(r.url); return prev.filter(r=>r.id!==id); });
+    try { await db.delete_(db.STORES.RECORDINGS, id); } catch {}
+    try { await db.removeFromSyncQueue(id); } catch {}
     try { await fetch(`/api/recordings/${id}`,{method:'DELETE'}); } catch {}
   };
 
   const deleteSelected = async () => {
     if (!selectedRecs.size) return;
-    const ids = Array.from(selectedRecs);
+    const ids = Array.from(selectedRecs) as string[];
     setRecordings(prev => { prev.filter(r=>ids.includes(r.id)).forEach(r=>URL.revokeObjectURL(r.url)); return prev.filter(r=>!ids.includes(r.id)); });
     setSelectedRecs(new Set());
+    await Promise.all(ids.map(async (id) => {
+      try { await db.delete_(db.STORES.RECORDINGS, id); } catch {}
+      try { await db.removeFromSyncQueue(id); } catch {}
+    }));
     for (const id of ids) { try { await fetch(`/api/recordings/${id}`,{method:'DELETE'}); } catch {} }
   };
 

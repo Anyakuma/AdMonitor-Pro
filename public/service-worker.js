@@ -1,15 +1,12 @@
 // AdMonitor Pro Service Worker
 // Handles offline support, caching strategy, background sync, and push notifications
 
-const CACHE_VERSION = 'v1';
-const CACHE_NAME = `admonitor-${CACHE_VERSION}`;
+const CACHE_VERSION = 'v2';
 const STATIC_CACHE = `admonitor-static-${CACHE_VERSION}`;
 const RUNTIME_CACHE = `admonitor-runtime-${CACHE_VERSION}`;
 
 // Files to cache on install
 const STATIC_ASSETS = [
-  '/',
-  '/index.html',
   '/manifest.json'
 ];
 
@@ -51,7 +48,7 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// Fetch event - network-first strategy for API, cache-first for assets
+// Fetch event - network-first for navigations/API, cache-first for immutable assets
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   const url = new URL(request.url);
@@ -92,35 +89,47 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Static assets: Cache-first strategy
+  // Always fetch navigations fresh first so a new deploy cannot be pinned to a stale HTML shell.
+  if (request.mode === 'navigate') {
+    event.respondWith(
+      fetch(request)
+        .then((response) => {
+          if (response.ok) {
+            const cache = caches.open(RUNTIME_CACHE);
+            cache.then((c) => c.put('/index.html', response.clone()));
+          }
+          return response;
+        })
+        .catch(() => {
+          return caches.match('/index.html').then((response) => {
+            return response || new Response('Offline - please check your connection', {
+              status: 503,
+              headers: { 'Content-Type': 'text/plain' }
+            });
+          });
+        })
+    );
+    return;
+  }
+
+  const isHashedAsset = url.pathname.startsWith('/assets/');
+
+  // Static assets: Cache-first for hashed bundles, network-first for everything else
   event.respondWith(
-    caches.match(request)
+    (isHashedAsset ? caches.match(request) : Promise.resolve(undefined))
       .then((cachedResponse) => {
-        if (cachedResponse) {
-          return cachedResponse;
-        }
+        if (cachedResponse) return cachedResponse;
+
         return fetch(request)
           .then((response) => {
-            // Cache successful responses
             if (response.ok) {
-              const cache = caches.open(STATIC_CACHE);
+              const targetCache = isHashedAsset ? STATIC_CACHE : RUNTIME_CACHE;
+              const cache = caches.open(targetCache);
               cache.then((c) => c.put(request, response.clone()));
             }
             return response;
           })
-          .catch(() => {
-            // Return offline fallback for navigation requests
-            if (request.mode === 'navigate') {
-              return caches.match('/index.html').then((response) => {
-                return response || new Response('Offline - please check your connection', {
-                  status: 503,
-                  headers: { 'Content-Type': 'text/plain' }
-                });
-              });
-            }
-            // Return offline response for other requests
-            return new Response('Offline', { status: 503 });
-          });
+          .catch(() => caches.match(request).then((response) => response || new Response('Offline', { status: 503 })));
       })
   );
 });
@@ -192,8 +201,8 @@ self.addEventListener('push', (event) => {
   console.log('[Service Worker] Push notification received');
 
   let notificationOptions = {
-    badge: '/icon-192.png',
-    icon: '/icon-192.png',
+    badge: '/vite.svg',
+    icon: '/vite.svg',
     tag: 'admonitor-notification',
     requireInteraction: false,
     vibrate: [200, 100, 200],

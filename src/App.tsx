@@ -582,9 +582,11 @@ export default function App() {
     typeof navigator !== 'undefined' ? navigator.onLine : true
   );
   const [updateAvailable, setUpdateAvailable] = useState(false);
-  const [isMobile, setIsMobile] = useState(
-    typeof window !== 'undefined' ? /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) : false
-  );
+  const [isMobile, setIsMobile] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return window.matchMedia('(max-width: 768px)').matches ||
+      window.matchMedia('(pointer: coarse)').matches;
+  });
 
   // ── Refs ──────────────────────────────────────────────────────────────────
   const keywordsRef        = useRef(keywords);
@@ -670,14 +672,31 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const mobileMedia = window.matchMedia('(max-width: 768px)');
+    const coarseMedia = window.matchMedia('(pointer: coarse)');
+    const syncIsMobile = () => setIsMobile(mobileMedia.matches || coarseMedia.matches);
+
+    syncIsMobile();
+    mobileMedia.addEventListener('change', syncIsMobile);
+    coarseMedia.addEventListener('change', syncIsMobile);
+
+    return () => {
+      mobileMedia.removeEventListener('change', syncIsMobile);
+      coarseMedia.removeEventListener('change', syncIsMobile);
+    };
+  }, []);
+
   // ── PWA: Online/Offline monitoring ────────────────────────────────────────
   useEffect(() => {
     const handleOnline = () => {
       setIsOnline(true);
       toast.success('Back online. Syncing data...');
       // Trigger background sync for offline recordings
-      if ('serviceWorker' in navigator && 'sync' in navigator.serviceWorker.controller) {
-        navigator.serviceWorker.controller?.postMessage({ type: 'SYNC_RECORDINGS' });
+      if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage({ type: 'SYNC_RECORDINGS' });
       }
     };
 
@@ -1454,15 +1473,15 @@ export default function App() {
 
       {/* Header */}
       <header className="border-b border-zinc-800/60 sticky top-0 z-20 backdrop-blur-md bg-[#0f1117]/90">
-        <div className="max-w-6xl mx-auto px-4 h-14 flex items-center justify-between">
-          <div className="flex items-center gap-3">
+        <div className="max-w-6xl mx-auto px-4 min-h-14 py-2 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3 min-w-0">
             <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center">
               <Radio size={17} className="text-white" />
             </div>
-            <span className="font-bold tracking-tight">AdMonitor <span className="text-blue-500">Pro</span></span>
+            <span className="font-bold tracking-tight truncate">AdMonitor <span className="text-blue-500">Pro</span></span>
             <span className="hidden sm:inline text-[10px] bg-zinc-800 text-zinc-400 px-2 py-0.5 rounded-full font-mono tracking-wider">v2 RADIO ENGINE</span>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1 sm:gap-2 shrink-0">
             <button onClick={()=>setShowDebug(!showDebug)}
               className={`p-2 rounded-lg transition-colors ${showDebug?'bg-zinc-700 text-zinc-200':'hover:bg-zinc-800 text-zinc-500'}`}
               title="Detection Log">
@@ -1870,7 +1889,7 @@ export default function App() {
 
         {/* RIGHT */}
         <div className="lg:col-span-8">
-          <div className="bg-zinc-900 rounded-2xl border border-zinc-800 overflow-hidden flex flex-col min-h-[600px] md:min-h-[800px] lg:min-h-[900px]">
+          <div className="bg-zinc-900 rounded-2xl border border-zinc-800 overflow-hidden flex flex-col min-h-[420px] md:min-h-[800px] lg:min-h-[900px]">
 
             <div className="p-5 border-b border-zinc-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="flex items-center gap-3">
@@ -1883,10 +1902,10 @@ export default function App() {
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <div className="relative">
+                <div className="relative w-full sm:w-auto">
                   <Search size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-600"/>
                   <input type="text" placeholder="Search…" value={searchQuery} onChange={e=>setSearchQuery(e.target.value)}
-                    className="pl-8 pr-3 py-2 bg-zinc-800 border border-zinc-700 rounded-xl text-xs w-32 outline-none focus:border-blue-500 text-zinc-200 placeholder-zinc-600"/>
+                    className="pl-8 pr-3 py-2 bg-zinc-800 border border-zinc-700 rounded-xl text-xs w-full sm:w-32 outline-none focus:border-blue-500 text-zinc-200 placeholder-zinc-600"/>
                 </div>
                 <select value={sortBy} onChange={e=>setSortBy(e.target.value as any)}
                   className="px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-xl text-xs outline-none focus:border-blue-500 text-zinc-200">
@@ -1903,9 +1922,9 @@ export default function App() {
             </div>
 
             {selectedRecs.size > 0 && (
-              <div className="bg-blue-500/5 border-b border-blue-500/10 px-5 py-3 flex items-center justify-between">
+              <div className="bg-blue-500/5 border-b border-blue-500/10 px-5 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                 <span className="text-sm font-medium text-blue-400">{selectedRecs.size} selected</span>
-                <div className="flex gap-2">
+                <div className="flex flex-wrap gap-2">
                   <button onClick={deleteSelected} className="px-3 py-1.5 bg-zinc-800 border border-red-700/30 text-red-400 rounded-lg text-xs font-medium hover:bg-red-900/20 transition-colors">Delete</button>
                   <button onClick={exportZip} className="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-700 transition-colors">Export ZIP</button>
                 </div>

@@ -713,12 +713,31 @@ export default function App() {
     const syncIsMobile = () => setIsMobile(mobileMedia.matches || coarseMedia.matches);
 
     syncIsMobile();
-    mobileMedia.addEventListener('change', syncIsMobile);
-    coarseMedia.addEventListener('change', syncIsMobile);
+    if (typeof mobileMedia.addEventListener === 'function') {
+      mobileMedia.addEventListener('change', syncIsMobile);
+      coarseMedia.addEventListener('change', syncIsMobile);
+    } else {
+      // Mic/speech APIs require a secure context on non-localhost origins.
+      if (!window.isSecureContext) {
+        const secureMsg = 'This feature requires HTTPS on non-localhost devices. Open the app via https://... or localhost.';
+        setError(secureMsg);
+        toast.error(secureMsg);
+        return;
+      }
+
+      // Safari < 14 fallback
+      mobileMedia.addListener(syncIsMobile);
+      coarseMedia.addListener(syncIsMobile);
+    }
 
     return () => {
-      mobileMedia.removeEventListener('change', syncIsMobile);
-      coarseMedia.removeEventListener('change', syncIsMobile);
+      if (typeof mobileMedia.removeEventListener === 'function') {
+        mobileMedia.removeEventListener('change', syncIsMobile);
+        coarseMedia.removeEventListener('change', syncIsMobile);
+      } else {
+        mobileMedia.removeListener(syncIsMobile);
+        coarseMedia.removeListener(syncIsMobile);
+      }
     };
   }, []);
 
@@ -783,8 +802,10 @@ export default function App() {
 
   // Mic devices
   useEffect(() => {
-    navigator.mediaDevices?.enumerateDevices()
-      .then(d => setMicDevices(d.filter(d => d.kind === 'audioinput')))
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices?.enumerateDevices) return;
+    mediaDevices.enumerateDevices()
+      .then(d => setMicDevices(d.filter(device => device.kind === 'audioinput')))
       .catch(() => {});
   }, []);
 
@@ -1211,6 +1232,14 @@ export default function App() {
       setLiveTranscript('');
       postTriggerRef.current = 0;
     } else {
+      // Mic/speech APIs require a secure context on non-localhost origins.
+      if (!window.isSecureContext) {
+        const secureMsg = 'This feature requires HTTPS on non-localhost devices. Open the app via https://... or localhost.';
+        setError(secureMsg);
+        toast.error(secureMsg);
+        return;
+      }
+
       // ── Mobile optimization: Adjust sample rate based on device ────
       const preferredSampleRate = isMobile ? 16000 : 48000;
       const fallbackSampleRate = isMobile ? 16000 : 32000;
@@ -1291,7 +1320,15 @@ export default function App() {
               toast.success('Recording complete & saved. (30s pre + 30s post)');
             }
           } else {
-            // Pre-buffer rolling window: keep last 30 s = 120 chunks @ 250 ms
+      // Mic/speech APIs require a secure context on non-localhost origins.
+      if (!window.isSecureContext) {
+        const secureMsg = 'This feature requires HTTPS on non-localhost devices. Open the app via https://... or localhost.';
+        setError(secureMsg);
+        toast.error(secureMsg);
+        return;
+      }
+
+      // Pre-buffer rolling window: keep last 30 s = 120 chunks @ 250 ms
             if (rollingBufRef.current.length > 120) rollingBufRef.current.shift();
           }
         };
@@ -2163,3 +2200,4 @@ function MicOff({ size=24, className='' }: { size?:number; className?:string }) 
     </svg>
   );
 }
+

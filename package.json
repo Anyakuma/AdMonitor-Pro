@@ -25,6 +25,7 @@
     "pg": "^8.19.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "react-window": "^2.2.7",
     "sonner": "^2.0.7",
     "vite": "^6.2.0",
     "vosk-browser": "^0.0.8"

@@ -33,7 +33,7 @@
  *     noise during the first 3 seconds of listening
  */
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
 import {
@@ -48,6 +48,12 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Toaster, toast } from 'sonner';
 import { format } from 'date-fns';
 import * as db from './utils/db';
+
+// ⚡ PERFORMANCE OPTIMIZATIONS: Import utilities
+import { phoneticEngine } from './utils/phoneticCache';
+import type { PhoneticSignature } from './utils/phoneticCache';
+import { ManagedURLPool, BoundedQueue, CleanupRegistry, createDebounce, createThrottle } from './utils/memoryManagement';
+import { voteOnHypotheses_OPTIMIZED, matchTranscriptToKeyword_OPTIMIZED, getFilteredAndSortedRecordings } from './utils/optimizedFunctions';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -621,6 +627,7 @@ export default function App() {
       window.matchMedia('(pointer: coarse)').matches;
   });
 
+  // ⚡ OPTIMIZATION 7: Consolidate ref-syncing useEffects into ONE
   // ── Refs ──────────────────────────────────────────────────────────────────
   const keywordsRef        = useRef(keywords);
   const sensitivityRef     = useRef(sensitivity);
@@ -629,25 +636,57 @@ export default function App() {
   const isRecordingRef     = useRef(isRecording);
   const filterEnabledRef   = useRef(filterEnabled);
   const noiseFloorRef      = useRef(0);
+  const detectorModeRef    = useRef(detectorMode);
 
-  useEffect(() => { keywordsRef.current    = keywords;   }, [keywords]);
-  useEffect(() => { sensitivityRef.current = sensitivity; }, [sensitivity]);
-  useEffect(() => { isPausedRef.current    = isPaused;   }, [isPaused]);
-  useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
-  useEffect(() => { filterEnabledRef.current = filterEnabled; }, [filterEnabled]);
+  // ⚡ OPTIMIZATION 8: Memory management refs
+  const urlPoolRef    = useRef(new ManagedURLPool());
+  const cleanupRef    = useRef(new CleanupRegistry());
+  const transcriptQueueRef = useRef(new BoundedQueue<string>(10)); // Bounded!
+  const noiseCalibQueueRef = useRef(new BoundedQueue<number>(90));
 
-  // Expanded keyword map (rebuilt whenever keywords change)
-  const expandedMapRef = useRef<Map<string, string[]>>(new Map());
-  const homoMapRef     = useRef<Map<string, string[]>>(new Map());
+  // Consolidated ref sync: ONE effect instead of FIVE
   useEffect(() => {
-    const em = new Map<string, string[]>();
-    const hm = new Map<string, string[]>();
+    keywordsRef.current = keywords;
+    sensitivityRef.current = sensitivity;
+    isPausedRef.current = isPaused;
+    isRecordingRef.current = isRecording;
+    filterEnabledRef.current = filterEnabled;
+    detectorModeRef.current = detectorMode;
+  }, [keywords, sensitivity, isPaused, isRecording, filterEnabled, detectorMode]);
+
+  // ⚡ OPTIMIZATION 4: Cache keyword signatures (rebuilt whenever keywords change)
+  const [keywordSignatures, setKeywordSignatures] = useState<Map<string, PhoneticSignature>>(new Map());
+  const keywordSignaturesRef = useRef(keywordSignatures);
+  
+  useEffect(() => {
+    keywordSignaturesRef.current = keywordSignatures;
+  }, [keywordSignatures]);
+
+  // 🔴 BUG #2 FIX: Build keyword signatures whenever keywords change
+  useEffect(() => {
+    const sigs = new Map<string, PhoneticSignature>();
+    const expMap = new Map<string, string[]>();
+    const homoMap = new Map<string, string[]>();
+
     for (const kw of keywords) {
-      em.set(kw, expandKeyword(kw));
-      hm.set(kw, getHomophones(kw));
+      const variants = expandKeyword(kw);
+      const homos = getHomophones(kw);
+      
+      sigs.set(kw, {
+        base: kw.toLowerCase(),
+        soundex: getSoundex(kw.toLowerCase()),
+        metaphone: getMetaphone(kw.toLowerCase()),
+        variants: new Set(variants),
+        homophones: new Set(homos),
+      });
+      
+      expMap.set(kw, variants);
+      homoMap.set(kw, homos);
     }
-    expandedMapRef.current = em;
-    homoMapRef.current = hm;
+
+    setKeywordSignatures(sigs);
+    expandedMapRef.current = expMap;
+    homoMapRef.current = homoMap;
   }, [keywords]);
 
   // Per-keyword cooldown (prevents duplicate triggers)
@@ -666,6 +705,7 @@ export default function App() {
   const circBufRef        = useRef<Float32Array | null>(null);
   const writeHeadRef      = useRef(0);
   const triggerWriteHeadRef = useRef(0); // snapshot of writeHead at the exact moment trigger fires
+  const triggerContextRef = useRef<{head: number; time: number; bufLen: number} | null>(null); // 🔴 BUG #5 FIX: More context for circular buffer safety
   const currentTrigRef    = useRef('');
   const currentConfRef    = useRef<Confidence>('Strong');
   const currentTransRef   = useRef('');
@@ -673,14 +713,27 @@ export default function App() {
   const currentVariantRef = useRef('');
   const processorRef      = useRef<ScriptProcessorNode | null>(null);
   const recordStartRef    = useRef(0);
-  const noiseCalibSamples = useRef<number[]>([]);
-  const transcriptWindowRef = useRef<string[]>([]);  // rolling last-N transcripts
-  const voskTranscriptWindowRef = useRef<string[]>([]);
-  const detectorModeRef    = useRef(detectorMode);
   const voskModelRef       = useRef<any>(null);
   const voskRecognizerRef  = useRef<any>(null);
   const webSpeechHitRef    = useRef<SourceDetection | null>(null);
   const voskHitRef         = useRef<SourceDetection | null>(null);
+  const expandedMapRef     = useRef<Map<string, string[]>>(new Map()); // 🔴 BUG #1
+  const homoMapRef         = useRef<Map<string, string[]>>(new Map()); // 🔴 BUG #1
+  const voskTranscriptWindowRef = useRef<string[]>([]); // 🔴 BUG #1
+  const noiseCalibSamples  = useRef<number[]>([]); // 🔴 BUG #1 - Noise floor calibration buffer
+  
+  // ⚡ OPTIMIZATION 3: Throttle FFT updates (10Hz instead of 30Hz)
+  const fftThrottleRef = useRef(0);
+  const throttleFftRef = useRef(createThrottle((bins: number[]) => setFftBins(bins), 100));
+  
+  // ⚡ OPTIMIZATION 3: Debounce search updates (300ms)
+  const [debouncedSearch, setDebouncedSearch] = useState(searchQuery);
+  const debounceSearchRef = useRef(createDebounce(setDebouncedSearch, 300));
+  
+  const handleSearchChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    setSearchQuery(e.target.value);
+    debounceSearchRef.current(e.target.value);
+  }, []);
 
   // Theme
   useEffect(() => {
@@ -799,6 +852,49 @@ export default function App() {
       };
     }
   }, []);
+
+  // ⚡ OPTIMIZATION 8: Comprehensive memory cleanup on unmount
+  useEffect(() => {
+    return () => {
+      try {
+        // Cleanup Vosk
+        voskRecognizerRef.current?.remove?.();
+        voskModelRef.current?.terminate?.();
+      } catch {}
+      
+      try {
+        // Stop audio streams
+        streamRef.current?.getTracks().forEach(t => t.stop());
+        recognitionRef.current?.stop?.();
+        continuousRecRef.current?.stop?.();
+        processorRef.current?.disconnect?.();
+      } catch {}
+      
+      try {
+        // Cancel animation frames
+        if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      } catch {}
+      
+      try {
+        // Cleanup URL objects
+        for (const rec of recordings) {
+          urlPoolRef.current.revokeURL(rec.blob, rec.url);
+        }
+        urlPoolRef.current.clear();
+      } catch {}
+      
+      try {
+        // Cleanup all registered resources
+        cleanupRef.current?.cleanup();
+      } catch {}
+      
+      try {
+        // Clear bounded queues
+        transcriptQueueRef.current.clear();
+        noiseCalibQueueRef.current.clear();
+      } catch {}
+    };
+  }, [recordings]);
 
   // Mic devices
   useEffect(() => {
@@ -977,9 +1073,9 @@ export default function App() {
         const voiceActive = vadCounterRef.current > 0;
         setVadActive(voiceActive);
 
-        // FFT bars
+        // ⚡ OPTIMIZATION 3: Throttle FFT updates to 10Hz (100ms interval)
         const step = Math.floor(fData.length / BINS);
-        setFftBins(Array.from({length: BINS}, (_,i) => fData[i*step] / 255 * 100));
+        throttleFftRef.current(Array.from({length: BINS}, (_,i) => fData[i*step] / 255 * 100));
         animFrameRef.current = requestAnimationFrame(tick);
       };
       tick();
@@ -992,16 +1088,33 @@ export default function App() {
     confidence: Confidence, transcript: string, voteScore: number, variant: string
   ) => {
     let finalBlob = blob;
-    if (circBufRef.current && audioCtxRef.current) {
-      // Use the snapshotted write-head from trigger time for accurate pre-buffer extraction
-      finalBlob = circularToWAV(
-        circBufRef.current,
-        triggerWriteHeadRef.current,   // where we were when keyword fired
-        writeHeadRef.current,           // where we are now (30 s later)
-        PRE_TRIGGER_SEC,
-        POST_TRIGGER_SEC,
-        audioCtxRef.current.sampleRate
-      );
+    // 🔴 BUG #5 FIX: Validate circular buffer context before extraction
+    if (circBufRef.current && audioCtxRef.current && triggerContextRef.current) {
+      const trigCtx = triggerContextRef.current;
+      const bufLen = circBufRef.current.length;
+      
+      // Safety check: calculate if buffer has wrapped too many times since trigger
+      const timeSinceTrigger = Date.now() - trigCtx.time;
+      const bufDurationMs = (bufLen / audioCtxRef.current.sampleRate) * 1000; // milliseconds covered by buffer
+      const wrapsEstimate = timeSinceTrigger / bufDurationMs;
+      
+      // If more than 1.5 wraps estimated, data may be corrupted; be conservative
+      if (wrapsEstimate > 1.5) {
+        appendDebug(`Warning: Circular buffer may have wrapped ${wrapsEstimate.toFixed(1)}x; audio may be incomplete`);
+      }
+      
+      try {
+        finalBlob = circularToWAV(
+          circBufRef.current,
+          trigCtx.head,   // where we were when keyword fired
+          writeHeadRef.current,           // where we are now (30 s later)
+          PRE_TRIGGER_SEC,
+          POST_TRIGGER_SEC,
+          audioCtxRef.current.sampleRate
+        );
+      } catch(e) {
+        appendDebug(`Circular buffer extraction failed: ${e}; using fallback blob`);
+      }
     }
     const url = URL.createObjectURL(finalBlob);
     const rec: Recording = {
@@ -1055,6 +1168,12 @@ export default function App() {
     currentVariantRef.current = variant;
     recordStartRef.current    = Date.now();
     triggerWriteHeadRef.current = writeHeadRef.current; // ← snapshot pre-buffer anchor
+    // 🔴 BUG #5 FIX: Capture full context for circular buffer safety
+    triggerContextRef.current = {
+      head: writeHeadRef.current,
+      time: Date.now(),
+      bufLen: circBufRef.current?.length || 0
+    };
     postTriggerRef.current    = POST_CHUNKS;            // exactly 30 s of post-trigger
     setIsRecording(true);
     setLastDetected(word);
@@ -1320,15 +1439,7 @@ export default function App() {
               toast.success('Recording complete & saved. (30s pre + 30s post)');
             }
           } else {
-      // Mic/speech APIs require a secure context on non-localhost origins.
-      if (!window.isSecureContext) {
-        const secureMsg = 'This feature requires HTTPS on non-localhost devices. Open the app via https://... or localhost.';
-        setError(secureMsg);
-        toast.error(secureMsg);
-        return;
-      }
-
-      // Pre-buffer rolling window: keep last 30 s = 120 chunks @ 250 ms
+            // Pre-buffer rolling window: keep last 30 s = 120 chunks @ 250 ms
             if (rollingBufRef.current.length > 120) rollingBufRef.current.shift();
           }
         };
@@ -1380,24 +1491,22 @@ export default function App() {
             // Add combined rolling window as an extra high-weight hypothesis
             hyps.push({ transcript: combined, confidence: 0.9 });
 
-            // Also add transcript window (cross-phrase detection)
-            transcriptWindowRef.current.push(combined.trim());
-            if (transcriptWindowRef.current.length > 6) transcriptWindowRef.current.shift();
-            const windowJoined = transcriptWindowRef.current.join(' ');
+            // Also add transcript window (cross-phrase detection) - Use bounded queue
+            const boundedTranscript = combined.trim();
+            transcriptQueueRef.current.push(boundedTranscript);
+            const windowJoined = transcriptQueueRef.current.join(' ');
             hyps.push({ transcript: windowJoined, confidence: 0.7 });
 
-            setLiveTranscript(combined.trim().slice(-150));
-            appendDebug(`Speech: "${combined.trim().slice(0,80)}" (${hyps.length} hypotheses, ${keywordsRef.current.length} keywords)`);
+            setLiveTranscript(boundedTranscript.slice(-150));
+            appendDebug(`Speech: "${boundedTranscript.slice(0,80)}" (${hyps.length} hypotheses, ${keywordSignaturesRef.current.size} keywords)`);
 
-            const result = voteOnHypotheses(
-              hyps, keywordsRef.current,
-              expandedMapRef.current, sensitivityRef.current, homoMapRef.current
-            );
+            // ⚡ OPTIMIZATION 4: Use optimized voting with cached signatures
+            const result = voteOnHypotheses_OPTIMIZED(hyps, keywordSignaturesRef.current, sensitivityRef.current);
 
             if (result.matched) {
               appendDebug(`✓ Match! kw="${result.keyword}" conf=${result.confidence} vote=${(result.voteScore*100).toFixed(0)}% variant="${result.variant}"`);
               maybeTriggerFromSources('webspeech', result);
-            } else if (keywordsRef.current.length > 0) {
+            } else if (keywordSignaturesRef.current.size > 0) {
               appendDebug(`✗ No match (sensitivity=${sensitivityRef.current}, vad=${vadCounterRef.current})`);
             }
           };
@@ -1526,19 +1635,85 @@ export default function App() {
     setSelectedRecs(new Set());
   };
 
-  const filteredRecs = recordings
-    .filter(r => r.triggerWord.toLowerCase().includes(searchQuery.toLowerCase()) || (r.transcript||'').toLowerCase().includes(searchQuery.toLowerCase()))
-    .sort((a,b) => sortBy==='time' ? b.timestamp.getTime()-a.timestamp.getTime() : sortBy==='keyword' ? a.triggerWord.localeCompare(b.triggerWord) : b.duration-a.duration);
+  // ⚡ OPTIMIZATION 1: Memoize expensive computed values
+  const filteredRecs = useMemo(() => {
+    return getFilteredAndSortedRecordings(recordings, debouncedSearch, sortBy);
+  }, [recordings, debouncedSearch, sortBy]);
 
-  const toggleSel = (id: string) => setSelectedRecs(prev => { const s=new Set(prev); s.has(id)?s.delete(id):s.add(id); return s; });
-  const toggleAll = () => setSelectedRecs(selectedRecs.size===filteredRecs.length ? new Set() : new Set(filteredRecs.map(r=>r.id)));
+  const toggleSel = useCallback((id: string) => {
+    setSelectedRecs(prev => {
+      const s = new Set(prev);
+      s.has(id) ? s.delete(id) : s.add(id);
+      return s;
+    });
+  }, []);
 
-  const confColor = (c?: string) =>
-    c==='Strong' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400' :
-    c==='Good'   ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/20 dark:text-blue-400' :
-                   'bg-amber-100 text-amber-700 dark:bg-amber-900/20 dark:text-amber-400';
+  const toggleAll = useCallback(() => {
+    setSelectedRecs(
+      selectedRecs.size === filteredRecs.length 
+        ? new Set() 
+        : new Set(filteredRecs.map(r => r.id))
+    );
+  }, [selectedRecs.size, filteredRecs.length, filteredRecs]);
 
-  const sensitivityLabel = ['','Strict','Tight','Balanced','Loose','Broad'][sensitivity];
+  const confColor = useMemo(() => (c?: string) =>
+    c === 'Strong' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400' :
+    c === 'Good' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/20 dark:text-blue-400' :
+    'bg-amber-100 text-amber-700 dark:bg-amber-900/20 dark:text-amber-400',
+  []);
+
+  const sensitivityLabel = useMemo(() => 
+    ['', 'Strict', 'Tight', 'Balanced', 'Loose', 'Broad'][sensitivity], 
+    [sensitivity]
+  );
+
+  // ⚡ OPTIMIZATION 2: Create useCallback versions of handlers
+  const handleDeleteRecording = useCallback((id: string) => {
+    deleteRecording(id);
+  }, []);
+
+  const handlePlayClick = useCallback((rec: Recording) => {
+    const el = document.getElementById(`audio-${rec.id}`) as HTMLAudioElement;
+    if (!el) return;
+    if (playingId === rec.id) {
+      el.pause();
+      setPlayingId(null);
+    } else {
+      document.querySelectorAll('audio').forEach(a => a.pause());
+      el.currentTime = 0;
+      el.play();
+      setPlayingId(rec.id);
+    }
+  }, [playingId]);
+
+  const handleExportZip = useCallback(async () => {
+    await exportZip();
+  }, [recordings, selectedRecs]);
+
+  const handleDeleteSelected = useCallback(async () => {
+    await deleteSelected();
+  }, [selectedRecs, recordings]);
+
+  // 🔴 BUG #7 FIX: Proper URL management for downloads to prevent leaks
+  const downloadRecording = useCallback((rec: Recording) => {
+    const u = urlPoolRef.current.getOrCreateURL(rec.blob);
+    try {
+      const a = document.createElement('a');
+      a.href = u;
+      a.download = `ad_${rec.triggerWord}_${rec.id}.wav`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch(e) {
+      appendDebug(`Download failed: ${e}`);
+      toast.error('Download failed');
+    } finally {
+      // Revoke URL immediately after download is initiated
+      setTimeout(() => {
+        urlPoolRef.current.revokeURL(rec.blob, u);
+      }, 100);
+    }
+  }, [appendDebug]);
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -2030,7 +2205,8 @@ export default function App() {
               <div className="flex flex-wrap items-center gap-2">
                 <div className="relative w-full sm:w-auto">
                   <Search size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-600"/>
-                  <input type="text" placeholder="Search…" value={searchQuery} onChange={e=>setSearchQuery(e.target.value)}
+                  {/* ⚡ OPTIMIZATION 3: Debounced search (300ms) */}
+                  <input type="text" placeholder="Search…" value={searchQuery} onChange={handleSearchChange}
                     className="pl-8 pr-3 py-2 bg-zinc-800 border border-zinc-700 rounded-xl text-xs w-full sm:w-32 outline-none focus:border-blue-500 text-zinc-200 placeholder-zinc-600"/>
                 </div>
                 <select value={sortBy} onChange={e=>setSortBy(e.target.value as any)}
@@ -2039,8 +2215,9 @@ export default function App() {
                   <option value="keyword">By Keyword</option>
                   <option value="duration">By Duration</option>
                 </select>
+                {/* ⚡ OPTIMIZATION 2: Use memoized callback */}
                 {recordings.length>0 && (
-                  <button onClick={exportZip} className="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors">
+                  <button onClick={handleExportZip} className="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors">
                     <Download size={12}/>Export
                   </button>
                 )}
@@ -2051,8 +2228,9 @@ export default function App() {
               <div className="bg-blue-500/5 border-b border-blue-500/10 px-5 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                 <span className="text-sm font-medium text-blue-400">{selectedRecs.size} selected</span>
                 <div className="flex flex-wrap gap-2">
-                  <button onClick={deleteSelected} className="px-3 py-1.5 bg-zinc-800 border border-red-700/30 text-red-400 rounded-lg text-xs font-medium hover:bg-red-900/20 transition-colors">Delete</button>
-                  <button onClick={exportZip} className="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-700 transition-colors">Export ZIP</button>
+                  {/* ⚡ OPTIMIZATION 2: Use memoized callback */}
+                  <button onClick={handleDeleteSelected} className="px-3 py-1.5 bg-zinc-800 border border-red-700/30 text-red-400 rounded-lg text-xs font-medium hover:bg-red-900/20 transition-colors">Delete</button>
+                  <button onClick={handleExportZip} className="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-700 transition-colors">Export ZIP</button>
                 </div>
               </div>
             )}
@@ -2128,7 +2306,7 @@ export default function App() {
 
                           <div className="flex items-center gap-1 self-center opacity-100 transition-opacity">
                             <button
-                              onClick={()=>{const u=URL.createObjectURL(rec.blob);const a=document.createElement('a');a.href=u;a.download=`ad_${rec.triggerWord}_${rec.id}.wav`;document.body.appendChild(a);a.click();document.body.removeChild(a);setTimeout(()=>URL.revokeObjectURL(u),1000);}}
+                              onClick={() => downloadRecording(rec)}
                               className="p-2 text-zinc-600 hover:text-blue-400 hover:bg-blue-500/10 rounded-lg transition-colors" title="Download">
                               <Download size={15}/>
                             </button>

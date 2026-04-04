@@ -4,8 +4,9 @@
  */
 
 import React, { useMemo, useCallback, useState } from 'react';
+// @ts-ignore - react-window types have issues
 import { FixedSizeList as List } from 'react-window';
-import { Recording } from '../App';
+import type { Recording } from '../services/recordingService';
 import RecordingListItem from './RecordingListItem';
 
 interface VirtualizedRecordingListProps {

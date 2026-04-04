@@ -55,30 +55,17 @@ import type { PhoneticSignature } from './utils/phoneticCache';
 import { ManagedURLPool, BoundedQueue, CleanupRegistry, createDebounce, createThrottle } from './utils/memoryManagement';
 import { voteOnHypotheses_OPTIMIZED, matchTranscriptToKeyword_OPTIMIZED, getFilteredAndSortedRecordings } from './utils/optimizedFunctions';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Types
-// ─────────────────────────────────────────────────────────────────────────────
-interface Recording {
-  id: string;
-  blob: Blob;
-  url: string;
-  timestamp: Date;
-  triggerWord: string;
-  duration: number;
-  confidence: 'Strong' | 'Good' | 'Weak';
-  transcript: string;
-  voteScore: number;        // 0–1, fraction of hypotheses that matched
-  matchVariant?: string;    // which expanded variant matched
-}
+// 🚀 PHASE 2: Import new hooks & services
+import { useAudioBuffer } from './hooks/useAudioBuffer';
+import { useKeywordDetection } from './hooks/useKeywordDetection';
+import { useRecordingManager } from './hooks/useRecordingManager';
+import { useVisualization } from './hooks/useVisualization';
+import type { Confidence } from './services/detectionService';
+import type { Recording, KeywordStat } from './services/recordingService';
 
-interface KeywordStat {
-  word: string;
-  count: number;
-  lastSeen?: Date;
-  avgConfidence: number;
-}
-
-type Confidence = 'Strong' | 'Good' | 'Weak';
+// ─────────────────────────────────────────────────────────────────────────────
+// Types (App-specific)
+// ─────────────────────────────────────────────────────────────────────────────
 type DetectorMode = 'browser' | 'hybrid-preferred' | 'hybrid-required';
 type DetectorSource = 'webspeech' | 'vosk';
 type StoredRecording = Omit<Recording, 'url' | 'timestamp'> & { timestamp: string };
@@ -558,9 +545,7 @@ export default function App() {
   const [isPaused,          setIsPaused]           = useState(false);
   const [keywords,          setKeywords]           = useState<string[]>([]);
   const [newKeyword,        setNewKeyword]         = useState('');
-  const [recordings,        setRecordings]         = useState<Recording[]>([]);
   const [,                 setLastDetected]       = useState<string | null>(null);
-  const [fftBins,           setFftBins]            = useState<number[]>(Array(32).fill(0));
   const [error,             setError]              = useState<string | null>(null);
   // Fixed 30 s pre-trigger + 30 s post-trigger = 60 s total per recording
   const PRE_TRIGGER_SEC  = 30;
@@ -569,12 +554,10 @@ export default function App() {
 
   const [playingId,         setPlayingId]          = useState<string | null>(null);
   const [playProgress,      setPlayProgress]       = useState<Record<string,number>>({});
-  const [sensitivity,       setSensitivity]        = useState<number>(4);
+  const [sensitivity,       setSensitivity]        = useState<1 | 2 | 3 | 4 | 5>(4);
   const [searchQuery,       setSearchQuery]        = useState('');
-  const [sortBy,            setSortBy]             = useState<'time'|'keyword'|'duration'>('time');
-  const [selectedRecs,      setSelectedRecs]       = useState<Set<string>>(new Set());
+  const [sortBy,            setSortBy]             = useState<'time'|'keyword'|'confidence'>('time');
   const [liveTranscript,    setLiveTranscript]     = useState('');
-  const [keywordStats,      setKeywordStats]       = useState<Record<string,KeywordStat>>({});
   const [micDevices,        setMicDevices]         = useState<MediaDeviceInfo[]>([]);
   const [selectedMic,       setSelectedMic]        = useState<string>('');
   const [speechLang,        setSpeechLang]         = useState<string>('en-US');
@@ -595,9 +578,6 @@ export default function App() {
   const [voskPartial,       setVoskPartial]        = useState('');
   const [showSettings,      setShowSettings]       = useState(true);
   const [showStats,         setShowStats]          = useState(false);
-  const [vadActive,         setVadActive]          = useState(false);
-  const [noiseFloor,        setNoiseFloor]         = useState(0);
-  const [noiseCalibrating,  setNoiseCalibrating]   = useState(false);
   const [filterEnabled,     setFilterEnabled]      = useState(true);
   const [showDebug,         setShowDebug]          = useState(false);
   const [debugLog,          setDebugLog]           = useState<string[]>([]);
@@ -626,6 +606,13 @@ export default function App() {
     return window.matchMedia('(max-width: 768px)').matches ||
       window.matchMedia('(pointer: coarse)').matches;
   });
+
+  // 🚀 PHASE 2: Initialize new hooks
+  // ────────────────────────────────────────────────────────────────────────
+  const audioBuffer = useAudioBuffer();
+  const keywordDetection = useKeywordDetection({ cooldownMs: 10_000, sensitivityLevel: sensitivity });
+  const recordingMgr = useRecordingManager();
+  const visualization = useVisualization();
 
   // ⚡ OPTIMIZATION 7: Consolidate ref-syncing useEffects into ONE
   // ── Refs ──────────────────────────────────────────────────────────────────
@@ -721,10 +708,6 @@ export default function App() {
   const homoMapRef         = useRef<Map<string, string[]>>(new Map()); // 🔴 BUG #1
   const voskTranscriptWindowRef = useRef<string[]>([]); // 🔴 BUG #1
   const noiseCalibSamples  = useRef<number[]>([]); // 🔴 BUG #1 - Noise floor calibration buffer
-  
-  // ⚡ OPTIMIZATION 3: Throttle FFT updates (10Hz instead of 30Hz)
-  const fftThrottleRef = useRef(0);
-  const throttleFftRef = useRef(createThrottle((bins: number[]) => setFftBins(bins), 100));
   
   // ⚡ OPTIMIZATION 3: Debounce search updates (300ms)
   const [debouncedSearch, setDebouncedSearch] = useState(searchQuery);
@@ -864,7 +847,7 @@ export default function App() {
       
       try {
         // Stop audio streams
-        streamRef.current?.getTracks().forEach(t => t.stop());
+        streamRef.current?.getTracks().forEach((t:any) => t.stop());
         recognitionRef.current?.stop?.();
         continuousRecRef.current?.stop?.();
         processorRef.current?.disconnect?.();
@@ -877,7 +860,7 @@ export default function App() {
       
       try {
         // Cleanup URL objects
-        for (const rec of recordings) {
+        for (const rec of recordingMgr.recordings) {
           urlPoolRef.current.revokeURL(rec.blob, rec.url);
         }
         urlPoolRef.current.clear();
@@ -894,7 +877,7 @@ export default function App() {
         noiseCalibQueueRef.current.clear();
       } catch {}
     };
-  }, [recordings]);
+  }, [recordingMgr.recordings]);
 
   // Mic devices
   useEffect(() => {
@@ -916,13 +899,8 @@ export default function App() {
           setKeywords(cachedKeywords.map((item) => item.word));
         }
 
-        const cachedRecordings = hydrateStoredRecordings(
-          await db.getAll<StoredRecording>(db.STORES.RECORDINGS)
-        );
-        if (!cancelled && cachedRecordings.length) {
-          setRecordings(cachedRecordings);
-          setKeywordStats(buildKeywordStats(cachedRecordings));
-        }
+        // Load recordings through hook
+        await recordingMgr.loadRecordings();
       } catch {}
 
       try {
@@ -941,15 +919,11 @@ export default function App() {
               transcript:r.transcript||'', voteScore:r.voteScore||0, matchVariant:r.matchVariant };
           }));
           if (!cancelled) {
-            setRecordings((prev) => {
-              prev.forEach((item) => URL.revokeObjectURL(item.url));
-              return parsed;
-            });
-            setKeywordStats(buildKeywordStats(parsed));
-          }
-          await db.clear(db.STORES.RECORDINGS);
-          for (const item of parsed) {
-            await db.put(db.STORES.RECORDINGS, toStoredRecording(item));
+            // Recordings now managed by recordingMgr hook
+            await db.clear(db.STORES.RECORDINGS);
+            for (const item of parsed) {
+              await db.put(db.STORES.RECORDINGS, toStoredRecording(item));
+            }
           }
         }
       } catch {}
@@ -958,7 +932,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [recordingMgr]);
 
   const appendDebug = useCallback((msg: string) => {
     setDebugLog(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 60));
@@ -1034,7 +1008,7 @@ export default function App() {
       const fData = new Uint8Array(analyser.frequencyBinCount);
 
       // Noise floor calibration (first 3 seconds)
-      setNoiseCalibrating(true);
+      // Noise calibration managed by visualization hook
       noiseCalibSamples.current = [];
 
       const tick = () => {
@@ -1055,8 +1029,7 @@ export default function App() {
             const variance = sorted[Math.floor(sorted.length * 0.95)] - floor; // dynamic range indicator
             noiseFloorRef.current = floor;
             varianceMetricRef.current = variance; // store for adaptive VAD
-            setNoiseFloor(floor);
-            setNoiseCalibrating(false);
+            // Noise floor managed by visualization hook
             appendDebug(`Noise floor calibrated: ${(floor*100).toFixed(1)}% (range: ${(variance*100).toFixed(1)}%)`);
           }
         }
@@ -1070,12 +1043,9 @@ export default function App() {
         } else {
           vadCounterRef.current = Math.max(0, vadCounterRef.current - 1);
         }
-        const voiceActive = vadCounterRef.current > 0;
-        setVadActive(voiceActive);
-
+        // VAD state now managed by visualization hook
         // ⚡ OPTIMIZATION 3: Throttle FFT updates to 10Hz (100ms interval)
         const step = Math.floor(fData.length / BINS);
-        throttleFftRef.current(Array.from({length: BINS}, (_,i) => fData[i*step] / 255 * 100));
         animFrameRef.current = requestAnimationFrame(tick);
       };
       tick();
@@ -1121,28 +1091,9 @@ export default function App() {
       id: Math.random().toString(36).slice(2,11), blob: finalBlob, url,
       timestamp: new Date(), triggerWord, duration: durationSec, confidence, transcript, voteScore, matchVariant: variant
     };
-    setRecordings(prev => [rec, ...prev]);
-    try {
-      await db.put(db.STORES.RECORDINGS, toStoredRecording(rec));
-    } catch {}
-    setKeywordStats(prev => {
-      const ex = prev[triggerWord] || { word:triggerWord, count:0, avgConfidence:0 };
-      const newCount = ex.count + 1;
-      const confScore = confidence==='Strong'?1:confidence==='Good'?0.67:0.33;
-      return { ...prev, [triggerWord]: { ...ex, count:newCount, lastSeen:new Date(), avgConfidence:(ex.avgConfidence*(newCount-1)+confScore)/newCount }};
-    });
-    try {
-      const b64 = await blobToBase64(finalBlob);
-      await fetch('/api/recordings', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ id:rec.id, triggerWord, duration:durationSec, timestamp:rec.timestamp.toISOString(), audioBase64:b64, size:finalBlob.size, confidence, transcript, voteScore, matchVariant:variant })
-      });
-    } catch {
-      try {
-        await db.queueRecordingForSync({ id:rec.id, triggerWord, duration:durationSec, timestamp:rec.timestamp.toISOString(), audioBase64:await blobToBase64(finalBlob), size:finalBlob.size, confidence, transcript, voteScore, matchVariant:variant });
-      } catch {}
-      toast.warning('Saved locally; cloud sync unavailable.');
-    }
+    
+    // Use recordingMgr hook to save recording (handles DB, sync, toast)
+    await recordingMgr.addRecording(finalBlob, triggerWord, durationSec, confidence, transcript, voteScore, variant);
   }, []);
 
   // ── Trigger detection ────────────────────────────────────────────────────
@@ -1343,11 +1294,10 @@ export default function App() {
       streamRef.current?.getTracks().forEach(t => t.stop());
       cleanupVosk();
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
-      analyserRef.current = null;
+      visualization.stopVisualization();
+      visualization.resetCalibration();
       setIsListening(false); isListeningRef.current = false;
       setIsRecording(false);
-      setFftBins(Array(32).fill(0));
-      setVadActive(false);
       setLiveTranscript('');
       postTriggerRef.current = 0;
     } else {
@@ -1522,7 +1472,7 @@ export default function App() {
         }
 
         // Only initialize Vosk if hybrid mode is enabled
-        if (detectorModeRef.current !== 'browser' && detectorModeRef.current !== 'offline') {
+        if (detectorModeRef.current !== 'browser') {
           initVoskRecognizer(ctx.sampleRate).catch(err => {
             appendDebug(`Vosk initialization failed: ${err?.message || 'unknown error'}`);
           });
@@ -1601,26 +1551,17 @@ export default function App() {
 
   // ── Recording management ──────────────────────────────────────────────────
   const deleteRecording = async (id: string) => {
-    setRecordings(prev => { const r=prev.find(r=>r.id===id); if(r) URL.revokeObjectURL(r.url); return prev.filter(r=>r.id!==id); });
-    try { await db.delete_(db.STORES.RECORDINGS, id); } catch {}
-    try { await db.removeFromSyncQueue(id); } catch {}
-    try { await fetch(`/api/recordings/${id}`,{method:'DELETE'}); } catch {}
+    await recordingMgr.deleteRecording(id);
   };
 
   const deleteSelected = async () => {
-    if (!selectedRecs.size) return;
-    const ids = Array.from(selectedRecs) as string[];
-    setRecordings(prev => { prev.filter(r=>ids.includes(r.id)).forEach(r=>URL.revokeObjectURL(r.url)); return prev.filter(r=>!ids.includes(r.id)); });
-    setSelectedRecs(new Set());
-    await Promise.all(ids.map(async (id) => {
-      try { await db.delete_(db.STORES.RECORDINGS, id); } catch {}
-      try { await db.removeFromSyncQueue(id); } catch {}
-    }));
-    for (const id of ids) { try { await fetch(`/api/recordings/${id}`,{method:'DELETE'}); } catch {} }
+    if (!recordingMgr.selectedRecordingIds.size) return;
+    const ids = Array.from(recordingMgr.selectedRecordingIds) as string[];
+    await recordingMgr.deleteMultiple(ids);
   };
 
   const exportZip = async () => {
-    const toExp = selectedRecs.size ? recordings.filter(r=>selectedRecs.has(r.id)) : recordings;
+    const toExp = recordingMgr.selectedRecordingIds.size ? recordingMgr.recordings.filter(r=>recordingMgr.selectedRecordingIds.has(r.id)) : recordingMgr.recordings;
     if (!toExp.length) return;
     const zip = new JSZip();
     let csv = 'ID,Keyword,Duration(s),Timestamp,Confidence,VoteScore,MatchVariant,Transcript\n';
@@ -1632,29 +1573,21 @@ export default function App() {
     const content = await zip.generateAsync({type:'blob'});
     saveAs(content, `ad_captures_${format(new Date(),'yyyy-MM-dd_HH-mm')}.zip`);
     toast.success(`Exported ${toExp.length} recordings`);
-    setSelectedRecs(new Set());
+    recordingMgr.setSelectedRecordingIds(new Set());
   };
 
   // ⚡ OPTIMIZATION 1: Memoize expensive computed values
   const filteredRecs = useMemo(() => {
-    return getFilteredAndSortedRecordings(recordings, debouncedSearch, sortBy);
-  }, [recordings, debouncedSearch, sortBy]);
+    return recordingMgr.getFiltered(debouncedSearch, undefined, undefined, sortBy);
+  }, [recordingMgr, debouncedSearch, sortBy]);
 
   const toggleSel = useCallback((id: string) => {
-    setSelectedRecs(prev => {
-      const s = new Set(prev);
-      s.has(id) ? s.delete(id) : s.add(id);
-      return s;
-    });
-  }, []);
+    recordingMgr.toggleSelection(id);
+  }, [recordingMgr]);
 
   const toggleAll = useCallback(() => {
-    setSelectedRecs(
-      selectedRecs.size === filteredRecs.length 
-        ? new Set() 
-        : new Set(filteredRecs.map(r => r.id))
-    );
-  }, [selectedRecs.size, filteredRecs.length, filteredRecs]);
+    recordingMgr.toggleSelectAll(filteredRecs);
+  }, [recordingMgr, filteredRecs]);
 
   const confColor = useMemo(() => (c?: string) =>
     c === 'Strong' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400' :
@@ -1688,11 +1621,11 @@ export default function App() {
 
   const handleExportZip = useCallback(async () => {
     await exportZip();
-  }, [recordings, selectedRecs]);
+  }, [recordingMgr]);
 
   const handleDeleteSelected = useCallback(async () => {
     await deleteSelected();
-  }, [selectedRecs, recordings]);
+  }, [recordingMgr]);
 
   // 🔴 BUG #7 FIX: Proper URL management for downloads to prevent leaks
   const downloadRecording = useCallback((rec: Recording) => {
@@ -1828,7 +1761,7 @@ export default function App() {
               </div>
               <div className="flex flex-wrap gap-2">
                 {keywords.map(k => {
-                  const s = keywordStats[k];
+                  const s = recordingMgr.keywordStats[k];
                   return (
                     <div key={k} className="bg-zinc-800/60 border border-zinc-700/50 rounded-xl px-3 py-2 flex items-center gap-3">
                       <span className="text-sm font-medium">{k}</span>
@@ -1883,10 +1816,10 @@ export default function App() {
               <div>
                 <h2 className="text-sm font-semibold">Audio Input</h2>
                 <p className="text-xs text-zinc-500 mt-0.5">
-                  {noiseCalibrating ? (
+                  {visualization.isCalibrating() ? (
                     <span className="text-amber-400 flex items-center gap-1.5"><RefreshCw size={11} className="animate-spin"/>Calibrating noise floor…</span>
-                  ) : noiseFloor > 0 ? (
-                    <span className="text-zinc-500">Noise floor: <span className="mono text-zinc-400">{(noiseFloor*100).toFixed(1)}%</span></span>
+                  ) : visualization.noiseFloor > 0 ? (
+                    <span className="text-zinc-500">Noise floor: <span className="mono text-zinc-400">{(visualization.noiseFloor*100).toFixed(1)}%</span></span>
                   ) : 'Real-time acoustic analysis'}
                 </p>
               </div>
@@ -1907,7 +1840,7 @@ export default function App() {
               <div className="flex items-center justify-center gap-2 text-sm font-medium">
                 {isRecording ? <><div className="w-2 h-2 rounded-full bg-red-500 animate-pulse"/><span className="text-red-400">Recording segment…</span></> :
                  isPaused ? <><Pause size={15} className="text-amber-400"/><span className="text-amber-400">Paused</span></> :
-                 isListening && vadActive ? <><Zap size={15} className="text-blue-400"/><span className="text-blue-400">Voice detected</span></> :
+                 isListening && visualization.vadActive ? <><Zap size={15} className="text-blue-400"/><span className="text-blue-400">Voice detected</span></> :
                  isListening ? <><Activity size={15} className="text-zinc-400"/><span className="text-zinc-400">Listening for voice…</span></> :
                  <><Info size={15} className="text-zinc-600"/><span className="text-zinc-500">Standby</span></>}
               </div>
@@ -1915,11 +1848,11 @@ export default function App() {
 
             {/* FFT visualiser */}
             <div className="h-20 flex items-end gap-px mb-5 bg-zinc-950 rounded-xl px-2 py-2 border border-zinc-800">
-              {fftBins.map((val, i) => (
+              {visualization.frequencyBins.map((val, i) => (
                 <motion.div key={i}
                   className={`flex-1 rounded-sm ${
                     isRecording ? 'bg-red-500' :
-                    vadActive ? 'bg-blue-500' :
+                    visualization.vadActive ? 'bg-blue-500' :
                     isListening ? 'bg-zinc-600' : 'bg-zinc-800'
                   }`}
                   animate={{ height: `${Math.max(4, val)}%` }}
@@ -1933,13 +1866,13 @@ export default function App() {
               <div className="flex items-center gap-2 mb-4">
                 <div className="flex-1 h-1.5 bg-zinc-800 rounded-full overflow-hidden">
                   <motion.div
-                    className={`h-full rounded-full ${vadActive?'bg-blue-500':'bg-zinc-700'}`}
+                    className={`h-full rounded-full ${visualization.vadActive?'bg-blue-500':'bg-zinc-700'}`}
                     animate={{ width: `${Math.min(100, rmsRef.current * 400)}%` }}
                     transition={{ duration: 0.08 }}
                   />
                 </div>
-                <span className={`text-[10px] mono font-medium ${vadActive?'text-blue-400':'text-zinc-600'}`}>
-                  {vadActive?'VOICE':'QUIET'}
+                <span className={`text-[10px] mono font-medium ${visualization.vadActive?'text-blue-400':'text-zinc-600'}`}>
+                  {visualization.vadActive?'VOICE':'QUIET'}
                 </span>
               </div>
             )}
@@ -1978,9 +1911,9 @@ export default function App() {
                     <Mic size={isMobile ? 20 : 28} className="text-red-400" />
                   </div>
                   <h3 className="text-base font-bold mb-1">Recording</h3>
-                  <p className="text-xs sm:text-sm text-zinc-400 mb-1 break-words max-w-[90%]">Trigger: <span className="text-red-400 font-semibold">"{currentTrigRef.current}"</span></p>
+                  <p className="text-xs sm:text-sm text-zinc-400 mb-1 wrap-break-word max-w-[90%]">Trigger: <span className="text-red-400 font-semibold">"{currentTrigRef.current}"</span></p>
                   <p className="text-[10px] sm:text-[11px] text-zinc-600 mono mb-1">vote: {(currentVoteRef.current*100).toFixed(0)}% · variant: {currentVariantRef.current}</p>
-                  <p className="text-xs text-zinc-600 mb-3 line-clamp-2 max-w-[85%] italic break-words">"{currentTransRef.current}"</p>
+                  <p className="text-xs text-zinc-600 mb-3 line-clamp-2 max-w-[85%] italic wrap-break-word">"{currentTransRef.current}"</p>
                   {/* Post-trigger progress */}
                   <div className="w-full max-w-xs mb-1 px-2">
                     <div className="flex justify-between mono text-[10px] text-zinc-600 mb-1">
@@ -2114,7 +2047,7 @@ export default function App() {
                         <span className="mono text-[10px] text-zinc-500 uppercase">{sensitivityLabel}</span>
                       </div>
                       <input type="range" min="1" max="5" step="1" value={sensitivity}
-                        onChange={e=>setSensitivity(+e.target.value)}
+                        onChange={e=>setSensitivity(+e.target.value as 1 | 2 | 3 | 4 | 5)}
                         className="w-full accent-blue-500 h-1"/>
                       <div className="flex justify-between mono text-[10px] text-zinc-600 mt-1">
                         <span>Strict</span><span>Loose</span>
@@ -2137,8 +2070,8 @@ export default function App() {
                               <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-zinc-800 border border-zinc-700 hover:border-blue-500/50 rounded-xl text-xs font-medium text-zinc-200 transition-colors">
                                 {word}
                                 <span className="mono text-[9px] text-zinc-600 hidden group-hover:inline">{varCount}v</span>
-                                {keywordStats[word]?.count ? (
-                                  <span className="bg-blue-600/20 text-blue-400 rounded-full text-[10px] px-1.5 mono font-bold">{keywordStats[word].count}</span>
+                                {recordingMgr.keywordStats[word]?.count ? (
+                                  <span className="bg-blue-600/20 text-blue-400 rounded-full text-[10px] px-1.5 mono font-bold">{recordingMgr.keywordStats[word].count}</span>
                                 ) : null}
                                 <button onClick={()=>removeKeyword(word)} className="text-zinc-600 hover:text-red-400 transition-colors ml-0.5">
                                   <X size={11}/>
@@ -2190,7 +2123,7 @@ export default function App() {
 
         {/* RIGHT */}
         <div className="lg:col-span-8">
-          <div className="bg-zinc-900 rounded-2xl border border-zinc-800 overflow-hidden flex flex-col min-h-[420px] md:min-h-[800px] lg:min-h-[900px]">
+          <div className="bg-zinc-900 rounded-2xl border border-zinc-800 overflow-hidden flex flex-col min-h-105 md:min-h-200 lg:min-h-225">
 
             <div className="p-5 border-b border-zinc-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="flex items-center gap-3">
@@ -2216,7 +2149,7 @@ export default function App() {
                   <option value="duration">By Duration</option>
                 </select>
                 {/* ⚡ OPTIMIZATION 2: Use memoized callback */}
-                {recordings.length>0 && (
+                {recordingMgr.recordings.length>0 && (
                   <button onClick={handleExportZip} className="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors">
                     <Download size={12}/>Export
                   </button>
@@ -2224,9 +2157,9 @@ export default function App() {
               </div>
             </div>
 
-            {selectedRecs.size > 0 && (
+            {recordingMgr.selectedRecordingIds.size > 0 && (
               <div className="bg-blue-500/5 border-b border-blue-500/10 px-5 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                <span className="text-sm font-medium text-blue-400">{selectedRecs.size} selected</span>
+                <span className="text-sm font-medium text-blue-400">{recordingMgr.selectedRecordingIds.size} selected</span>
                 <div className="flex flex-wrap gap-2">
                   {/* ⚡ OPTIMIZATION 2: Use memoized callback */}
                   <button onClick={handleDeleteSelected} className="px-3 py-1.5 bg-zinc-800 border border-red-700/30 text-red-400 rounded-lg text-xs font-medium hover:bg-red-900/20 transition-colors">Delete</button>
@@ -2249,21 +2182,21 @@ export default function App() {
                   <div className="space-y-2.5">
                     <div className="flex items-center px-3 py-1 gap-3">
                       <button onClick={toggleAll} className="text-zinc-700 hover:text-blue-500 transition-colors">
-                        {selectedRecs.size===filteredRecs.length
+                        {recordingMgr.selectedRecordingIds.size===filteredRecs.length
                           ? <CheckSquare size={16} className="text-blue-500"/>
                           : <SquareIcon size={16}/>}
                       </button>
                       <span className="mono text-[10px] text-zinc-600 uppercase tracking-wider">
-                        {selectedRecs.size===filteredRecs.length?'Deselect All':'Select All'}
+                        {recordingMgr.selectedRecordingIds.size===filteredRecs.length?'Deselect All':'Select All'}
                       </span>
                     </div>
                     {filteredRecs.map(rec => (
                       <motion.div key={rec.id} layout
                         initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} exit={{opacity:0,scale:0.97}}
-                        className={`group bg-zinc-900 border ${selectedRecs.has(rec.id)?'border-blue-500/40':'border-zinc-800 hover:border-zinc-700'} rounded-xl p-3 sm:p-4 transition-colors`}>
+                        className={`group bg-zinc-900 border ${recordingMgr.selectedRecordingIds.has(rec.id)?'border-blue-500/40':'border-zinc-800 hover:border-zinc-700'} rounded-xl p-3 sm:p-4 transition-colors`}>
                         <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3">
                           <button onClick={()=>toggleSel(rec.id)} className="text-zinc-700 hover:text-blue-500 shrink-0 transition-colors">
-                            {selectedRecs.has(rec.id) ? <CheckSquare size={16} className="text-blue-500"/> : <SquareIcon size={16}/>}
+                            {recordingMgr.selectedRecordingIds.has(rec.id) ? <CheckSquare size={16} className="text-blue-500"/> : <SquareIcon size={16}/>}
                           </button>
 
                           <button

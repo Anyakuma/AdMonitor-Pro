@@ -7,7 +7,8 @@ import React, { useCallback, useMemo } from 'react';
 import { motion } from 'framer-motion';
 import { Play, Download, Trash2, CheckSquare, Clock, Activity, AudioLines } from 'lucide-react';
 import { format } from 'date-fns';
-import { Recording, Confidence } from '../App';
+import type { Recording} from '../services/recordingService';
+import type { Confidence } from '../services/detectionService';
 
 interface RecordingListItemProps {
   rec: Recording;

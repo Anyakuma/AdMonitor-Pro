@@ -5,8 +5,8 @@
  * Replace the originals in App.tsx with these optimized versions.
  */
 
-import { PhoneticSignature } from './utils/phoneticCache';
-import { Confidence } from './App';
+import type { PhoneticSignature } from './phoneticCache';
+import type { Confidence } from '../services/detectionService';
 
 /**
  * ORIGINAL voteOnHypotheses (INEFFICIENT)

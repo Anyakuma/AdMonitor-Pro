@@ -124,8 +124,9 @@ self.addEventListener('fetch', (event) => {
           .then((response) => {
             if (response.ok) {
               const targetCache = isHashedAsset ? STATIC_CACHE : RUNTIME_CACHE;
-              const cache = caches.open(targetCache);
-              cache.then((c) => c.put(request, response.clone()));
+              // Clone BEFORE consuming the response
+              const responseClone = response.clone();
+              caches.open(targetCache).then((c) => c.put(request, responseClone));
             }
             return response;
           })

@@ -1555,13 +1555,13 @@ export default function App() {
   };
 
   const deleteSelected = async () => {
-    if (!recordingMgr.selectedRecordingIds.size) return;
-    const ids = Array.from(recordingMgr.selectedRecordingIds) as string[];
+    if (!(recordingMgr?.selectedRecordingIds?.size)) return;
+    const ids = Array.from(recordingMgr?.selectedRecordingIds || new Set()) as string[];
     await recordingMgr.deleteMultiple(ids);
   };
 
   const exportZip = async () => {
-    const toExp = recordingMgr.selectedRecordingIds.size ? recordingMgr.recordings.filter(r=>recordingMgr.selectedRecordingIds.has(r.id)) : recordingMgr.recordings;
+    const toExp = (recordingMgr?.selectedRecordingIds?.size || 0) > 0 ? (recordingMgr?.recordings || []).filter(r=>recordingMgr?.selectedRecordingIds?.has(r.id)) : (recordingMgr?.recordings || []);
     if (!toExp.length) return;
     const zip = new JSZip();
     let csv = 'ID,Keyword,Duration(s),Timestamp,Confidence,VoteScore,MatchVariant,Transcript\n';
@@ -2157,9 +2157,9 @@ export default function App() {
               </div>
             </div>
 
-            {recordingMgr.selectedRecordingIds.size > 0 && (
+            {(recordingMgr?.selectedRecordingIds?.size || 0) > 0 && (
               <div className="bg-blue-500/5 border-b border-blue-500/10 px-5 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                <span className="text-sm font-medium text-blue-400">{recordingMgr.selectedRecordingIds.size} selected</span>
+                <span className="text-sm font-medium text-blue-400">{(recordingMgr?.selectedRecordingIds?.size || 0)} selected</span>
                 <div className="flex flex-wrap gap-2">
                   {/* ⚡ OPTIMIZATION 2: Use memoized callback */}
                   <button onClick={handleDeleteSelected} className="px-3 py-1.5 bg-zinc-800 border border-red-700/30 text-red-400 rounded-lg text-xs font-medium hover:bg-red-900/20 transition-colors">Delete</button>
@@ -2182,21 +2182,21 @@ export default function App() {
                   <div className="space-y-2.5">
                     <div className="flex items-center px-3 py-1 gap-3">
                       <button onClick={toggleAll} className="text-zinc-700 hover:text-blue-500 transition-colors">
-                        {recordingMgr.selectedRecordingIds.size===filteredRecs.length
+                        {(recordingMgr?.selectedRecordingIds?.size || 0)===filteredRecs.length
                           ? <CheckSquare size={16} className="text-blue-500"/>
                           : <SquareIcon size={16}/>}
                       </button>
                       <span className="mono text-[10px] text-zinc-600 uppercase tracking-wider">
-                        {recordingMgr.selectedRecordingIds.size===filteredRecs.length?'Deselect All':'Select All'}
+                        {(recordingMgr?.selectedRecordingIds?.size || 0)===filteredRecs.length?'Deselect All':'Select All'}
                       </span>
                     </div>
                     {filteredRecs.map(rec => (
                       <motion.div key={rec.id} layout
                         initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} exit={{opacity:0,scale:0.97}}
-                        className={`group bg-zinc-900 border ${recordingMgr.selectedRecordingIds.has(rec.id)?'border-blue-500/40':'border-zinc-800 hover:border-zinc-700'} rounded-xl p-3 sm:p-4 transition-colors`}>
+                        className={`group bg-zinc-900 border ${recordingMgr?.selectedRecordingIds?.has(rec.id)?'border-blue-500/40':'border-zinc-800 hover:border-zinc-700'} rounded-xl p-3 sm:p-4 transition-colors`}>
                         <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3">
                           <button onClick={()=>toggleSel(rec.id)} className="text-zinc-700 hover:text-blue-500 shrink-0 transition-colors">
-                            {recordingMgr.selectedRecordingIds.has(rec.id) ? <CheckSquare size={16} className="text-blue-500"/> : <SquareIcon size={16}/>}
+                            {recordingMgr?.selectedRecordingIds?.has(rec.id) ? <CheckSquare size={16} className="text-blue-500"/> : <SquareIcon size={16}/>}
                           </button>
 
                           <button

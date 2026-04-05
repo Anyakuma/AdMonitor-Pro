@@ -292,7 +292,11 @@ export const getFilteredAndSortedRecordings = (
 
   // Sort once
   return filtered.sort((a, b) => {
-    if (sortBy === 'time') return b.timestamp.getTime() - a.timestamp.getTime();
+    if (sortBy === 'time') {
+      const aTime = a.timestamp instanceof Date ? a.timestamp.getTime() : new Date(a.timestamp).getTime();
+      const bTime = b.timestamp instanceof Date ? b.timestamp.getTime() : new Date(b.timestamp).getTime();
+      return bTime - aTime;
+    }
     if (sortBy === 'keyword') return a.triggerWord.localeCompare(b.triggerWord);
     return b.duration - a.duration;
   });

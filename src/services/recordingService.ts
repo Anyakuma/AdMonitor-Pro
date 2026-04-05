@@ -248,7 +248,9 @@ export function filterAndSortRecordings(
   const sortBy = options.sortBy || 'time';
   filtered.sort((a, b) => {
     if (sortBy === 'time') {
-      return b.timestamp.getTime() - a.timestamp.getTime();
+      const aTime = a.timestamp instanceof Date ? a.timestamp.getTime() : new Date(a.timestamp).getTime();
+      const bTime = b.timestamp instanceof Date ? b.timestamp.getTime() : new Date(b.timestamp).getTime();
+      return bTime - aTime;
     } else if (sortBy === 'keyword') {
       return a.triggerWord.localeCompare(b.triggerWord);
     } else if (sortBy === 'confidence') {

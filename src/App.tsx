@@ -1872,7 +1872,8 @@ export default function App() {
               </div>
               <div className="flex flex-wrap gap-2">
                 {keywords.map(k => {
-                  const s = recordingMgr.keywordStats[k];
+                  const s = recordingMgr?.keywordStats?.[k];
+                  const variantCount = (expandedMapRef.current?.get?.(k)||[]).length || 0;
                   return (
                     <div key={k} className="bg-zinc-800/60 border border-zinc-700/50 rounded-xl px-3 py-2 flex items-center gap-3">
                       <span className="text-sm font-medium">{k}</span>
@@ -1880,7 +1881,7 @@ export default function App() {
                       {s?.avgConfidence && <div className="w-12 h-1 bg-zinc-700 rounded-full overflow-hidden"><div className="h-full bg-blue-500 rounded-full" style={{width:`${s.avgConfidence*100}%`}}/></div>}
                       {s?.lastSeen && <span className="text-[10px] text-zinc-600">{format(s.lastSeen,'h:mm a')}</span>}
                       <div className="text-[10px] text-zinc-600 flex gap-1">
-                        <span title="Phonetic variants">{(expandedMapRef.current.get(k)||[]).length}v</span>
+                        <span title="Phonetic variants">{variantCount}v</span>
                       </div>
                     </div>
                   );
@@ -2181,8 +2182,8 @@ export default function App() {
                               <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-zinc-800 border border-zinc-700 hover:border-blue-500/50 rounded-xl text-xs font-medium text-zinc-200 transition-colors">
                                 {word}
                                 <span className="mono text-[9px] text-zinc-600 hidden group-hover:inline">{varCount}v</span>
-                                {recordingMgr.keywordStats[word]?.count ? (
-                                  <span className="bg-blue-600/20 text-blue-400 rounded-full text-[10px] px-1.5 mono font-bold">{recordingMgr.keywordStats[word].count}</span>
+                                {recordingMgr?.keywordStats?.[word]?.count ? (
+                                  <span className="bg-blue-600/20 text-blue-400 rounded-full text-[10px] px-1.5 mono font-bold">{recordingMgr?.keywordStats?.[word]?.count}</span>
                                 ) : null}
                                 <button onClick={()=>removeKeyword(word)} className="text-zinc-600 hover:text-red-400 transition-colors ml-0.5">
                                   <X size={11}/>
@@ -2203,7 +2204,7 @@ export default function App() {
                         ['VAD gate', 'Adaptive RMS threshold', true],
                         ['Detector mode', detectorMode, true],
                         ['Secondary ASR', voskModelUrl ? `Vosk ${voskStatus}` : 'Not configured', voskStatus === 'ready' || !voskModelUrl],
-                        ['Phoneme expansion', keywords.length ? `${[...expandedMapRef.current.values()].reduce((s,a)=>s+a.length,0)} variants` : 'Add keywords', true],
+                        ['Phoneme expansion', keywords.length ? `${[...(expandedMapRef.current?.values?.() || [])].reduce((s,a)=>s+(a?.length||0),0)} variants` : 'Add keywords', true],
                         ['Multi-hypothesis', '8 alternatives + vote', true],
                         ['Soundex + Metaphone', 'Dual phonetic matching', true],
                         ['Cooldown', `${COOLDOWN_MS/1000}s per keyword`, true],

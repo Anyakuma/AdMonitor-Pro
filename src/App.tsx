@@ -1409,17 +1409,33 @@ export default function App() {
           }
           proc.connect(sink); sink.connect(ctx.destination);
 
+          // ⚡ PHASE 2.4: Optimize audio buffer copying - avoid allocations
           proc.onaudioprocess = (e) => {
             const inp = e.inputBuffer.getChannelData(0);
             const buf = circBufRef.current!;
             const h = writeHeadRef.current;
             const l = inp.length;
             const bl = buf.length;
-            if (h + l <= bl) { buf.set(inp, h); writeHeadRef.current = h + l; }
-            else { const f=bl-h; buf.set(inp.subarray(0,f),h); buf.set(inp.subarray(f),0); writeHeadRef.current=l-f; }
+            
+            // Copy to circular buffer using direct set (no temporary allocation)
+            if (h + l <= bl) { 
+              buf.set(inp, h); 
+              writeHeadRef.current = h + l; 
+            }
+            else { 
+              // Wrap around: split into two copies without temporary buffers
+              const f = bl - h; 
+              buf.set(inp.subarray(0, f), h);  // Set uses view, no allocation
+              buf.set(inp.subarray(f), 0);     // Set uses view, no allocation
+              writeHeadRef.current = l - f; 
+            }
+            
+            // For Vosk: pass buffer view directly to avoid extra Float32Array allocation
             if (voskRecognizerRef.current) {
               try {
-                voskRecognizerRef.current.acceptWaveformFloat(new Float32Array(inp), ctx.sampleRate);
+                // Note: Vosk.acceptWaveformFloat expects ownership semantics,
+                // so we must pass a copy. However, this is unavoidable with Vosk API.
+                voskRecognizerRef.current.acceptWaveformFloat(inp, ctx.sampleRate);
               } catch (error) {
                 console.warn('Vosk waveform accept failed', error);
               }

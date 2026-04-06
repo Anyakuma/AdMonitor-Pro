@@ -1032,6 +1032,13 @@ export default function App() {
             // Noise floor managed by visualization hook
             appendDebug(`Noise floor calibrated: ${(floor*100).toFixed(1)}% (range: ${(variance*100).toFixed(1)}%)`);
           }
+        } else {
+          // 🔴 BUG FIX #1: Continue updating variance metric after calibration
+          // Rolling average of last 30 samples to track environment changes
+          noiseCalibSamples.current.push(rmsRef.current);
+          if (noiseCalibSamples.current.length > 30) noiseCalibSamples.current.shift();
+          const sorted = [...noiseCalibSamples.current].sort((a,b)=>a-b);
+          varianceMetricRef.current = sorted[Math.floor(sorted.length * 0.95)] - sorted[0]; // continuous update
         }
 
         // VAD: voice detected if RMS > noiseFloor * multiplier (adaptive, more sensitive)
@@ -1057,44 +1064,51 @@ export default function App() {
     blob: Blob, triggerWord: string, durationSec: number,
     confidence: Confidence, transcript: string, voteScore: number, variant: string
   ) => {
-    let finalBlob = blob;
-    // 🔴 BUG #5 FIX: Validate circular buffer context before extraction
-    if (circBufRef.current && audioCtxRef.current && triggerContextRef.current) {
-      const trigCtx = triggerContextRef.current;
-      const bufLen = circBufRef.current.length;
-      
-      // Safety check: calculate if buffer has wrapped too many times since trigger
-      const timeSinceTrigger = Date.now() - trigCtx.time;
-      const bufDurationMs = (bufLen / audioCtxRef.current.sampleRate) * 1000; // milliseconds covered by buffer
-      const wrapsEstimate = timeSinceTrigger / bufDurationMs;
-      
-      // If more than 1.5 wraps estimated, data may be corrupted; be conservative
-      if (wrapsEstimate > 1.5) {
-        appendDebug(`Warning: Circular buffer may have wrapped ${wrapsEstimate.toFixed(1)}x; audio may be incomplete`);
+    try {
+      let finalBlob = blob;
+      // 🔴 BUG #5 FIX: Validate circular buffer context before extraction
+      if (circBufRef.current && audioCtxRef.current && triggerContextRef.current) {
+        const trigCtx = triggerContextRef.current;
+        const bufLen = circBufRef.current.length;
+        
+        // Safety check: calculate if buffer has wrapped too many times since trigger
+        const timeSinceTrigger = Date.now() - trigCtx.time;
+        const bufDurationMs = (bufLen / audioCtxRef.current.sampleRate) * 1000; // milliseconds covered by buffer
+        const wrapsEstimate = timeSinceTrigger / bufDurationMs;
+        
+        // If more than 1.5 wraps estimated, data may be corrupted; be conservative
+        if (wrapsEstimate > 1.5) {
+          appendDebug(`Warning: Circular buffer may have wrapped ${wrapsEstimate.toFixed(1)}x; audio may be incomplete`);
+        }
+        
+        try {
+          finalBlob = circularToWAV(
+            circBufRef.current,
+            trigCtx.head,   // where we were when keyword fired
+            writeHeadRef.current,           // where we are now (30 s later)
+            PRE_TRIGGER_SEC,
+            POST_TRIGGER_SEC,
+            audioCtxRef.current.sampleRate
+          );
+        } catch(e) {
+          appendDebug(`Circular buffer extraction failed: ${e}; using fallback blob`);
+        }
       }
+      const url = URL.createObjectURL(finalBlob);
+      const rec: Recording = {
+        id: Math.random().toString(36).slice(2,11), blob: finalBlob, url,
+        timestamp: new Date(), triggerWord, duration: durationSec, confidence, transcript, voteScore, matchVariant: variant
+      };
       
-      try {
-        finalBlob = circularToWAV(
-          circBufRef.current,
-          trigCtx.head,   // where we were when keyword fired
-          writeHeadRef.current,           // where we are now (30 s later)
-          PRE_TRIGGER_SEC,
-          POST_TRIGGER_SEC,
-          audioCtxRef.current.sampleRate
-        );
-      } catch(e) {
-        appendDebug(`Circular buffer extraction failed: ${e}; using fallback blob`);
-      }
+      // 🔴 BUG FIX #2: Use recordingMgr hook to save recording with proper error handling
+      await recordingMgr.addRecording(finalBlob, triggerWord, durationSec, confidence, transcript, voteScore, variant);
+      appendDebug(`✓ Recording saved: "${triggerWord}" ${(voteScore*100).toFixed(0)}% (${confidence})`);
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      appendDebug(`✗ Recording save failed: ${errMsg}`);
+      toast.error(`Failed to save recording: ${errMsg}`);
     }
-    const url = URL.createObjectURL(finalBlob);
-    const rec: Recording = {
-      id: Math.random().toString(36).slice(2,11), blob: finalBlob, url,
-      timestamp: new Date(), triggerWord, duration: durationSec, confidence, transcript, voteScore, matchVariant: variant
-    };
-    
-    // Use recordingMgr hook to save recording (handles DB, sync, toast)
-    await recordingMgr.addRecording(finalBlob, triggerWord, durationSec, confidence, transcript, voteScore, variant);
-  }, []);
+  }, [appendDebug]);
 
   // ── Trigger detection ────────────────────────────────────────────────────
   const triggerRecording = useCallback((
@@ -1380,10 +1394,23 @@ export default function App() {
           if (postTriggerRef.current > 0) {
             postTriggerRef.current--;
             if (postTriggerRef.current === 0) {
-              // POST_TRIGGER_SEC have elapsed — save using circular PCM buffer
+              // 🔴 BUG FIX #2: POST_TRIGGER_SEC have elapsed — save using circular PCM buffer with error handling
               const totalDuration = PRE_TRIGGER_SEC + POST_TRIGGER_SEC;
               const blob = new Blob(rollingBufRef.current, { type: mr.mimeType });
-              saveRecording(blob, currentTrigRef.current, totalDuration, currentConfRef.current, currentTransRef.current, currentVoteRef.current, currentVariantRef.current);
+              try {
+                // Call async saveRecording without blocking (fire and forget with .catch)
+                saveRecording(blob, currentTrigRef.current, totalDuration, currentConfRef.current, currentTransRef.current, currentVoteRef.current, currentVariantRef.current)
+                  .catch((err) => {
+                    const errMsg = err instanceof Error ? err.message : String(err);
+                    console.error(`Async save failed: ${errMsg}`);
+                    appendDebug(`Async save failed: ${errMsg}`);
+                    toast.error('Recording save failed');
+                  });
+              } catch (err) {
+                const errMsg = err instanceof Error ? err.message : String(err);
+                console.error(`Sync save error: ${errMsg}`);
+                appendDebug(`Sync save error: ${errMsg}`);
+              }
               rollingBufRef.current = [];
               setIsRecording(false);
               toast.success('Recording complete & saved. (30s pre + 30s post)');
@@ -1417,8 +1444,10 @@ export default function App() {
             const isCalibrating = noiseFloorRef.current === 0; // Still calibrating?
             const hasVoiceOrCalibrating = vadCounterRef.current > 0 || isCalibrating;
             
-            // Only skip if: we're done calibrating AND we have reliable VAD AND there's no voice detected
-            const shouldSkipForVAD = !isCalibrating && noiseFloorRef.current > 0.05 && !hasVoiceOrCalibrating && varianceMetricRef.current > 0.2;
+            // 🔴 BUG FIX #1: Only skip if we're reliably past calibration AND VAD clearly shows no voice
+            // Be less aggressive about skipping to avoid missing speech
+            const hasReliableCalibration = noiseFloorRef.current > 0.01 && noiseCalibSamples.current.length >= 90;
+            const shouldSkipForVAD = hasReliableCalibration && !hasVoiceOrCalibrating && varianceMetricRef.current > 0.1;
             if (shouldSkipForVAD) {
               appendDebug(`Speech skipped (low RMS: ${(rmsRef.current*100).toFixed(1)}% vs threshold ${(Math.max(0.01, noiseFloorRef.current * 2.5)*100).toFixed(1)}%)`);
               return;
@@ -1448,15 +1477,17 @@ export default function App() {
             hyps.push({ transcript: windowJoined, confidence: 0.7 });
 
             setLiveTranscript(boundedTranscript.slice(-150));
-            appendDebug(`Speech: "${boundedTranscript.slice(0,80)}" (${hyps.length} hypotheses, ${keywordSignaturesRef.current.size} keywords)`);
+            // 🔴 CRITICAL FIX: Null-check keywordSignaturesRef before accessing .size
+            const sigMap = keywordSignaturesRef.current || new Map();
+            appendDebug(`Speech: "${boundedTranscript.slice(0,80)}" (${hyps.length} hypotheses, ${sigMap.size} keywords)`);
 
             // ⚡ OPTIMIZATION 4: Use optimized voting with cached signatures
-            const result = voteOnHypotheses_OPTIMIZED(hyps, keywordSignaturesRef.current, sensitivityRef.current);
+            const result = voteOnHypotheses_OPTIMIZED(hyps, sigMap, sensitivityRef.current);
 
             if (result.matched) {
               appendDebug(`✓ Match! kw="${result.keyword}" conf=${result.confidence} vote=${(result.voteScore*100).toFixed(0)}% variant="${result.variant}"`);
               maybeTriggerFromSources('webspeech', result);
-            } else if (keywordSignaturesRef.current.size > 0) {
+            } else if (sigMap.size > 0) {
               appendDebug(`✗ No match (sensitivity=${sensitivityRef.current}, vad=${vadCounterRef.current})`);
             }
           };

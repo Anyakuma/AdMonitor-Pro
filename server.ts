@@ -219,8 +219,8 @@ async function startServer() {
     }
 
     try {
-      const result = await pool.query("SELECT word FROM keywords ORDER BY word ASC");
-      return res.json(result.rows.map((r) => r.word));
+      const result = await pool!.query("SELECT id, word FROM keywords ORDER BY word ASC");
+      return res.json(result.rows);
     } catch (err) {
       console.error("GET /api/keywords error:", err);
       return res.status(500).json({ error: "Failed to fetch keywords" });
@@ -237,21 +237,26 @@ async function startServer() {
       if (!word) {
         return res.status(400).json({ error: "Word is required" });
       }
-      await pool.query("INSERT INTO keywords (word) VALUES ($1) ON CONFLICT DO NOTHING", [word]);
-      return res.json({ success: true });
+      const result = await pool!.query("INSERT INTO keywords (word) VALUES ($1) ON CONFLICT (word) DO UPDATE SET word = EXCLUDED.word RETURNING id, word", [word]);
+      const keyword = result.rows[0];
+      return res.json({ success: true, id: keyword.id, word: keyword.word });
     } catch (err) {
       console.error("POST /api/keywords error:", err);
       return res.status(500).json({ error: "Failed to add keyword" });
     }
   });
 
-  app.delete("/api/keywords/:word", async (req, res) => {
+  app.delete("/api/keywords/:id", async (req, res) => {
     if (!isDatabaseEnabled()) {
       return res.json({ success: true, persisted: false });
     }
 
     try {
-      await pool.query("DELETE FROM keywords WHERE word = $1", [req.params.word]);
+      const id = Number.parseInt(req.params.id, 10);
+      if (Number.isNaN(id)) {
+        return res.status(400).json({ error: "Invalid keyword ID" });
+      }
+      await pool!.query("DELETE FROM keywords WHERE id = $1", [id]);
       return res.json({ success: true });
     } catch (err) {
       console.error("DELETE /api/keywords error:", err);
@@ -266,7 +271,7 @@ async function startServer() {
     }
 
     try {
-      const result = await pool.query(
+      const result = await pool!.query(
         "SELECT id, triggerWord, duration, timestamp, audioBase64, size, confidence, transcript, voteScore, matchVariant FROM recordings ORDER BY timestamp DESC"
       );
       return res.json(result.rows);
@@ -288,7 +293,7 @@ async function startServer() {
       }
       const { id, triggerWord, duration, timestamp, audioBase64, size, confidence, transcript, voteScore, matchVariant } = parsed.data;
 
-      await pool.query(
+      await pool!.query(
         "INSERT INTO recordings (id, triggerWord, duration, timestamp, audioBase64, size, confidence, transcript, voteScore, matchVariant) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         [id, triggerWord, duration, timestamp, audioBase64, size, confidence || "Strong", transcript || "", voteScore || 0, matchVariant || ""]
       );
@@ -305,7 +310,7 @@ async function startServer() {
     }
 
     try {
-      await pool.query("DELETE FROM recordings WHERE id = $1", [req.params.id]);
+      await pool!.query("DELETE FROM recordings WHERE id = $1", [req.params.id]);
       return res.json({ success: true });
     } catch (err) {
       console.error("DELETE /api/recordings error:", err);

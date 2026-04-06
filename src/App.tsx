@@ -1105,13 +1105,16 @@ export default function App() {
         for (let i = 0; i < BINS; i++) {
           bins[i] = Math.round((fData[i * step] || 0) / 255 * 100);
         }
-        visualization.updateFFT(bins);
+        // Update visualization - try calling directly instead of through context
+        if (typeof visualization.updateFFT === 'function') {
+          visualization.updateFFT(bins);
+        }
         
         animFrameRef.current = requestAnimationFrame(tick);
       };
       tick();
     } catch(e) { console.error('AudioContext error', e); }
-  }, [appendDebug, visualization]);
+  }, [appendDebug]);
 
   // ── Save recording ───────────────────────────────────────────────────────
   const saveRecording = useCallback(async (

@@ -1075,7 +1075,8 @@ export default function App() {
             const variance = sorted[Math.floor(sorted.length * 0.95)] - floor; // dynamic range indicator
             noiseFloorRef.current = floor;
             varianceMetricRef.current = variance; // store for adaptive VAD
-            // Noise floor managed by visualization hook
+            // Update visualization context with noise floor
+            visualization.setNoiseFloor(floor);
             appendDebug(`Noise floor calibrated: ${(floor*100).toFixed(1)}% (range: ${(variance*100).toFixed(1)}%)`);
           }
         } else {
@@ -1096,14 +1097,21 @@ export default function App() {
         } else {
           vadCounterRef.current = Math.max(0, vadCounterRef.current - 1);
         }
-        // VAD state now managed by visualization hook
+        // Update visualization context with VAD state and RMS
+        visualization.updateVAD(vadCounterRef.current > 0, rmsRef.current);
         // ⚡ OPTIMIZATION 3: Throttle FFT updates to 10Hz (100ms interval)
         const step = Math.floor(fData.length / BINS);
+        const bins = new Array(BINS);
+        for (let i = 0; i < BINS; i++) {
+          bins[i] = Math.round((fData[i * step] || 0) / 255 * 100);
+        }
+        visualization.updateFFT(bins);
+        
         animFrameRef.current = requestAnimationFrame(tick);
       };
       tick();
     } catch(e) { console.error('AudioContext error', e); }
-  }, [appendDebug]);
+  }, [appendDebug, visualization]);
 
   // ── Save recording ───────────────────────────────────────────────────────
   const saveRecording = useCallback(async (

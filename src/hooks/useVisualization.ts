@@ -148,6 +148,28 @@ export function useVisualization(options: UseVisualizationOptions = {}) {
     return noiseCalibSamplesRef.current.length < 90;
   }, []);
 
+  /**
+   * Directly update FFT bins (used from audio processing loop)
+   */
+  const updateFFT = useCallback((bins: number[]) => {
+    throttledUpdateRef.current(bins);
+  }, []);
+
+  /**
+   * Directly update VAD state and RMS (used from audio processing loop)
+   */
+  const updateVAD = useCallback((active: boolean, rmsValue: number) => {
+    setVadActive(active);
+    setRmsLevel(rmsValue);
+  }, []);
+
+  /**
+   * Directly set noise floor (used from audio processing loop)
+   */
+  const setNoiseFloorDirectly = useCallback((floor: number) => {
+    setNoiseFloor(floor);
+  }, []);
+
   return {
     // State
     frequencyBins,
@@ -162,6 +184,9 @@ export function useVisualization(options: UseVisualizationOptions = {}) {
     getVoiceActivityPercentge,
     getCalibrationProgress,
     isCalibrating,
+    updateFFT,
+    updateVAD,
+    setNoiseFloor: setNoiseFloorDirectly,
 
     // Refs (if needed for advanced usage)
     analyserRef,

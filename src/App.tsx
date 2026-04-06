@@ -384,7 +384,7 @@ const voteOnHypotheses = (
     }
   }
 
-  if (!votes.size) return NULL;
+  if (!votes || votes.size === 0) return NULL;
 
   // Pick keyword with highest weighted vote score
   let best: VoteResult = NULL;
@@ -1462,7 +1462,7 @@ export default function App() {
         rollingBufRef.current = []; postTriggerRef.current = 0;
 
         mr.ondataavailable = (e) => {
-          if (!e.data.size) return;
+          if (!e?.data?.size) return;
           rollingBufRef.current.push(e.data);
           if (postTriggerRef.current > 0) {
             postTriggerRef.current--;

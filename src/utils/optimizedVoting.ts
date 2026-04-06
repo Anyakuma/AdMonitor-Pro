@@ -4,6 +4,8 @@
  * ~5x faster than naive implementation (180ms → 35ms)
  */
 
+import { LevenshteinCache } from './levenshteinCache';
+
 export type Confidence = "Strong" | "Good" | "Weak";
 
 export interface PhoneticSignature {
@@ -49,6 +51,9 @@ class VotingBuffers {
 
 // Singleton buffers for all voting operations
 const buffers = new VotingBuffers();
+
+// ⚡ PHASE 2: Levenshtein distance cache for fuzzy matching
+const levenshteinCache = new LevenshteinCache();
 
 /**
  * Ultra-fast normalization function
@@ -246,4 +251,26 @@ export function getConfidenceFromScore(voteScore: number): Confidence {
   if (voteScore >= 0.85) return "Strong";
   if (voteScore >= 0.65) return "Good";
   return "Weak";
+}
+
+/**
+ * Check fuzzy match using Levenshtein distance cache
+ * Useful for catching variations missed by substring matching
+ * @param transcript Normalized transcript
+ * @param keyword Normalized keyword
+ * @param maxDistance Maximum edit distance to consider a match (typically 2-3)
+ * @returns True if distance is within threshold
+ */
+export function isFuzzyMatch(transcript: string, keyword: string, maxDistance: number = 2): boolean {
+  const dist = levenshteinCache.getDistanceIfBelow(transcript, keyword, maxDistance);
+  return dist >= 0 && dist <= maxDistance;
+}
+
+/**
+ * Pre-warm Levenshtein cache with keyword pairs
+ * Call after loading keywords to reduce cold-start latency
+ * @param keywords Array of keywords to pre-compute
+ */
+export function preWarmLevenshteinCache(keywords: string[]): void {
+  levenshteinCache.preWarm(keywords);
 }

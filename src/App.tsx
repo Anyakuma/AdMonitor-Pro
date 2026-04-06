@@ -54,7 +54,7 @@ import { phoneticEngine } from './utils/phoneticCache';
 import type { PhoneticSignature } from './utils/optimizedVoting';
 import { ManagedURLPool, BoundedQueue, CleanupRegistry, createDebounce, createThrottle } from './utils/memoryManagement';
 import { voteOnHypotheses_OPTIMIZED as voteOnHypotheses_OLD, matchTranscriptToKeyword_OPTIMIZED, getFilteredAndSortedRecordings } from './utils/optimizedFunctions';
-import { voteOnHypotheses_OPTIMIZED, normalizeFast } from './utils/optimizedVoting';
+import { voteOnHypotheses_OPTIMIZED, normalizeFast, preWarmLevenshteinCache } from './utils/optimizedVoting';
 import { URLPool } from './utils/urlPool';
 
 // 🚀 PHASE 2: Import new hooks & services
@@ -651,32 +651,70 @@ export default function App() {
     keywordSignaturesRef.current = keywordSignatures;
   }, [keywordSignatures]);
 
-  // 🔴 BUG #2 FIX: Build keyword signatures whenever keywords change
-  useEffect(() => {
-    const sigs = new Map<string, PhoneticSignature>();
-    const expMap = new Map<string, string[]>();
-    const homoMap = new Map<string, string[]>();
+  // ⚡ PHASE 2: OPTIMIZATION #1 - Incremental keyword signature updates
+  // Only recompute added/removed keywords instead of rebuilding all signatures
+  const prevKeywordsRef = useRef<string[]>([]);
+  const signatureCacheRef = useRef<Map<string, PhoneticSignature>>(new Map());
 
-    for (const kw of keywords) {
-      const variants = expandKeyword(kw);
-      const homos = getHomophones(kw);
-      
-      sigs.set(kw, {
-        keyword: kw,
-        base: kw.toLowerCase(),
-        soundex: getSoundex(kw.toLowerCase()),
-        metaphone: getMetaphone(kw.toLowerCase()),
-        variants: variants,
-        homophones: homos,
-      });
-      
-      expMap.set(kw, variants);
-      homoMap.set(kw, homos);
+  useEffect(() => {
+    const prev = new Set(prevKeywordsRef.current);
+    const curr = new Set(keywords);
+    
+    // Find added and removed keywords
+    const added = keywords.filter(kw => !prev.has(kw));
+    const removed = prevKeywordsRef.current.filter(kw => !curr.has(kw));
+
+    // Only rebuild if there are changes
+    if (added.length > 0 || removed.length > 0) {
+      const sigs = new Map<string, PhoneticSignature>(signatureCacheRef.current);
+      const expMap = new Map<string, string[]>();
+      const homoMap = new Map<string, string[]>();
+
+      // Remove deleted keywords
+      for (const kw of removed) {
+        sigs.delete(kw);
+        signatureCacheRef.current.delete(kw);
+      }
+
+      // Add new keywords (skip expensive recomputation for unchanged ones)
+      for (const kw of added) {
+        const variants = expandKeyword(kw);
+        const homos = getHomophones(kw);
+        
+        const sig: PhoneticSignature = {
+          keyword: kw,
+          base: kw.toLowerCase(),
+          soundex: getSoundex(kw.toLowerCase()),
+          metaphone: getMetaphone(kw.toLowerCase()),
+          variants: variants,
+          homophones: homos,
+        };
+        
+        sigs.set(kw, sig);
+        signatureCacheRef.current.set(kw, sig);
+        expMap.set(kw, variants);
+        homoMap.set(kw, homos);
+      }
+
+      // Preserve unchanged keyword data for maps
+      for (const kw of keywords) {
+        if (added.includes(kw)) continue;  // Already added
+        if (removed.includes(kw)) continue; // Already removed
+        
+        // Keep existing variant/homophone data
+        const cached = signatureCacheRef.current.get(kw);
+        if (cached) {
+          expMap.set(kw, cached.variants);
+          homoMap.set(kw, cached.homophones);
+        }
+      }
+
+      setKeywordSignatures(sigs);
+      expandedMapRef.current = expMap;
+      homoMapRef.current = homoMap;
     }
 
-    setKeywordSignatures(sigs);
-    expandedMapRef.current = expMap;
-    homoMapRef.current = homoMap;
+    prevKeywordsRef.current = keywords;
   }, [keywords]);
 
   // Per-keyword cooldown (prevents duplicate triggers)
@@ -896,7 +934,10 @@ export default function App() {
       try {
         const cachedKeywords = await db.getCachedKeywords();
         if (!cancelled && cachedKeywords.length) {
-          setKeywords(cachedKeywords.map((item) => item.word));
+          const kwList = cachedKeywords.map((item) => item.word);
+          setKeywords(kwList);
+          // ⚡ PHASE 2: Warm Levenshtein cache for fuzzy matching
+          preWarmLevenshteinCache(kwList);
         }
 
         // Load recordings through hook
@@ -908,7 +949,11 @@ export default function App() {
         const [kw,rec] = await Promise.all([fetch('/api/keywords'),fetch('/api/recordings')]);
         if (kw.ok) {
           const nextKeywords = await kw.json();
-          if (!cancelled) setKeywords(nextKeywords);
+          if (!cancelled) {
+            setKeywords(nextKeywords);
+            // ⚡ PHASE 2: Warm Levenshtein cache for server keywords
+            preWarmLevenshteinCache(nextKeywords);
+          }
           await db.cacheKeywords(nextKeywords.map((word: string, index: number) => ({ id: index + 1, word })));
         }
         if (rec.ok) {

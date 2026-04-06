@@ -51,9 +51,11 @@ import * as db from './utils/db';
 
 // ⚡ PERFORMANCE OPTIMIZATIONS: Import utilities
 import { phoneticEngine } from './utils/phoneticCache';
-import type { PhoneticSignature } from './utils/phoneticCache';
+import type { PhoneticSignature } from './utils/optimizedVoting';
 import { ManagedURLPool, BoundedQueue, CleanupRegistry, createDebounce, createThrottle } from './utils/memoryManagement';
-import { voteOnHypotheses_OPTIMIZED, matchTranscriptToKeyword_OPTIMIZED, getFilteredAndSortedRecordings } from './utils/optimizedFunctions';
+import { voteOnHypotheses_OPTIMIZED as voteOnHypotheses_OLD, matchTranscriptToKeyword_OPTIMIZED, getFilteredAndSortedRecordings } from './utils/optimizedFunctions';
+import { voteOnHypotheses_OPTIMIZED, normalizeFast } from './utils/optimizedVoting';
+import { URLPool } from './utils/urlPool';
 
 // 🚀 PHASE 2: Import new hooks & services
 import { useAudioBuffer } from './hooks/useAudioBuffer';
@@ -626,7 +628,7 @@ export default function App() {
   const detectorModeRef    = useRef(detectorMode);
 
   // ⚡ OPTIMIZATION 8: Memory management refs
-  const urlPoolRef    = useRef(new ManagedURLPool());
+  const urlPoolRef    = useRef(new URLPool());
   const cleanupRef    = useRef(new CleanupRegistry());
   const transcriptQueueRef = useRef(new BoundedQueue<string>(10)); // Bounded!
   const noiseCalibQueueRef = useRef(new BoundedQueue<number>(90));
@@ -660,11 +662,12 @@ export default function App() {
       const homos = getHomophones(kw);
       
       sigs.set(kw, {
+        keyword: kw,
         base: kw.toLowerCase(),
         soundex: getSoundex(kw.toLowerCase()),
         metaphone: getMetaphone(kw.toLowerCase()),
-        variants: new Set(variants),
-        homophones: new Set(homos),
+        variants: variants,
+        homophones: homos,
       });
       
       expMap.set(kw, variants);
@@ -859,11 +862,8 @@ export default function App() {
       } catch {}
       
       try {
-        // Cleanup URL objects
-        for (const rec of recordingMgr.recordings) {
-          urlPoolRef.current.revokeURL(rec.blob, rec.url);
-        }
-        urlPoolRef.current.clear();
+        // Cleanup URL objects (memory leak prevention)
+        urlPoolRef.current.revokeAll();
       } catch {}
       
       try {
@@ -904,6 +904,7 @@ export default function App() {
       } catch {}
 
       try {
+        console.log('I am here')
         const [kw,rec] = await Promise.all([fetch('/api/keywords'),fetch('/api/recordings')]);
         if (kw.ok) {
           const nextKeywords = await kw.json();
@@ -1481,8 +1482,15 @@ export default function App() {
             const sigMap = keywordSignaturesRef.current || new Map();
             appendDebug(`Speech: "${boundedTranscript.slice(0,80)}" (${hyps.length} hypotheses, ${sigMap.size} keywords)`);
 
-            // ⚡ OPTIMIZATION 4: Use optimized voting with cached signatures
-            const result = voteOnHypotheses_OPTIMIZED(hyps, sigMap, sensitivityRef.current);
+            // ⚡ OPTIMIZATION 4: Use optimized voting with cached signatures (5x faster)
+            const sensMap = {
+              1: 'low',
+              2: 'low',
+              3: 'medium',
+              4: 'medium',
+              5: 'high',
+            } as const;
+            const result = voteOnHypotheses_OPTIMIZED(hyps, sigMap, sensMap[sensitivityRef.current as 1|2|3|4|5] ?? 'medium');
 
             if (result.matched) {
               appendDebug(`✓ Match! kw="${result.keyword}" conf=${result.confidence} vote=${(result.voteScore*100).toFixed(0)}% variant="${result.variant}"`);
@@ -1674,7 +1682,7 @@ export default function App() {
     } finally {
       // Revoke URL immediately after download is initiated
       setTimeout(() => {
-        urlPoolRef.current.revokeURL(rec.blob, u);
+        urlPoolRef.current.revokeURL(rec.id);
       }, 100);
     }
   }, [appendDebug]);

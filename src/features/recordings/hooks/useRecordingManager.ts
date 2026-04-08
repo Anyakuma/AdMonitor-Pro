@@ -3,9 +3,9 @@
  * Handles saving, loading, deleting, and exporting recordings
  */
 
-import { useCallback, useState, useMemo } from 'react';
+import { useCallback, useEffect, useRef, useState, useMemo } from 'react';
 import * as recordingService from '../services/recordingService';
-import * as db from '../utils/db';
+import * as db from '../../../lib/storage/db';
 
 export type Recording = recordingService.Recording;
 export type KeywordStat = recordingService.KeywordStat;
@@ -20,6 +20,7 @@ export function useRecordingManager(options: UseRecordingManagerOptions = {}) {
   const [selectedRecordingIds, setSelectedRecordingIds] = useState<Set<string>>(new Set());
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const recordingsRef = useRef<Recording[]>([]);
 
   const handleError = useCallback(
     (e: Error) => {
@@ -35,6 +36,26 @@ export function useRecordingManager(options: UseRecordingManagerOptions = {}) {
     },
     [options]
   );
+
+  const revokeRecordingUrls = useCallback((items: Recording[]) => {
+    for (const item of items) {
+      try {
+        URL.revokeObjectURL(item.url);
+      } catch {
+        // Best-effort cleanup for browser-managed blob URLs.
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    recordingsRef.current = recordings;
+  }, [recordings]);
+
+  useEffect(() => {
+    return () => {
+      revokeRecordingUrls(recordingsRef.current);
+    };
+  }, [revokeRecordingUrls]);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Recording CRUD Operations
@@ -97,16 +118,35 @@ export function useRecordingManager(options: UseRecordingManagerOptions = {}) {
   const loadRecordings = useCallback(async () => {
     try {
       setIsLoading(true);
-      const stored = await db.getAll(db.STORES.RECORDINGS);
-      setRecordings(stored);
-      return stored;
+      const stored = await db.getAll<recordingService.LegacyStoredRecording>(db.STORES.RECORDINGS);
+      const normalized = await recordingService.normalizeStoredRecordings(stored);
+      const { hydrated, migrated, deletedIds } = normalized;
+
+      await Promise.all([
+        ...migrated.map((item) => db.put(db.STORES.RECORDINGS, item)),
+        ...deletedIds.map((id) => db.delete_(db.STORES.RECORDINGS, id)),
+      ]);
+
+      setRecordings((prev) => {
+        revokeRecordingUrls(prev);
+        return hydrated;
+      });
+
+      setSelectedRecordingIds((prev) => {
+        if (prev.size === 0) return prev;
+
+        const validIds = new Set(hydrated.map((item) => item.id));
+        return new Set([...prev].filter((id) => validIds.has(id)));
+      });
+
+      return hydrated;
     } catch (e) {
       handleError(e as Error);
       return [];
     } finally {
       setIsLoading(false);
     }
-  }, [handleError]);
+  }, [handleError, revokeRecordingUrls]);
 
   /**
    * Delete a single recording

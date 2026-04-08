@@ -3,10 +3,8 @@
  * Extracted from App.tsx to improve testability and reusability
  */
 
-import JSZip from 'jszip';
-import { saveAs } from 'file-saver';
 import { format } from 'date-fns';
-import * as db from '../utils/db';
+import * as db from '../../../lib/storage/db';
 
 export interface Recording {
   id: string;
@@ -22,10 +20,22 @@ export interface Recording {
 }
 
 export interface StoredRecording
-  extends Omit<Recording, 'url' | 'timestamp' | 'blob'> {
+  extends Omit<Recording, 'url' | 'timestamp'> {
   timestamp: string;
-  audioBase64: string;
-  size: number;
+}
+
+export interface LegacyStoredRecording {
+  id: string;
+  timestamp?: string;
+  triggerWord?: string;
+  duration?: number;
+  confidence?: 'Strong' | 'Good' | 'Weak';
+  transcript?: string;
+  voteScore?: number;
+  matchVariant?: string;
+  blob?: Blob;
+  audioBase64?: string;
+  url?: string;
 }
 
 export interface KeywordStat {
@@ -39,9 +49,10 @@ export interface KeywordStat {
 // Serialization Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function toStoredRecording(recording: Recording): Omit<StoredRecording, 'audioBase64' | 'size'> {
+export function toStoredRecording(recording: Recording): StoredRecording {
   return {
     id: recording.id,
+    blob: recording.blob,
     timestamp: recording.timestamp.toISOString(),
     triggerWord: recording.triggerWord,
     duration: recording.duration,
@@ -52,14 +63,74 @@ export function toStoredRecording(recording: Recording): Omit<StoredRecording, '
   };
 }
 
-export function hydrateStoredRecordings(
-  items: Array<Omit<StoredRecording, 'audioBase64' | 'size'> & { blob: Blob }>
-): Recording[] {
-  return items.map((item) => ({
-    ...item,
-    url: URL.createObjectURL(item.blob),
-    timestamp: new Date(item.timestamp),
-  }));
+export function hydrateStoredRecordings(items: StoredRecording[]): Recording[] {
+  return items.flatMap((item) => {
+    if (!(item.blob instanceof Blob)) {
+      console.warn(
+        '[recordingService] Skipping legacy or malformed recording without blob payload:',
+        item.id
+      );
+      return [];
+    }
+
+    return [{
+      ...item,
+      url: URL.createObjectURL(item.blob),
+      timestamp: new Date(item.timestamp),
+    }];
+  });
+}
+
+export interface NormalizedRecordingsResult {
+  hydrated: Recording[];
+  migrated: StoredRecording[];
+  deletedIds: string[];
+}
+
+export async function normalizeStoredRecordings(
+  items: LegacyStoredRecording[]
+): Promise<NormalizedRecordingsResult> {
+  const hydrated: Recording[] = [];
+  const migrated: StoredRecording[] = [];
+  const deletedIds: string[] = [];
+
+  for (const item of items) {
+    let blob: Blob | null = item.blob instanceof Blob ? item.blob : null;
+
+    if (!blob && item.audioBase64) {
+      try {
+        blob = await base64ToBlob(item.audioBase64);
+      } catch (error) {
+        console.warn('[recordingService] Failed to recover recording from base64:', item.id, error);
+      }
+    }
+
+    if (!blob) {
+      deletedIds.push(item.id);
+      continue;
+    }
+
+    const stored: StoredRecording = {
+      id: item.id,
+      blob,
+      timestamp: item.timestamp || new Date(0).toISOString(),
+      triggerWord: item.triggerWord || 'unknown',
+      duration: typeof item.duration === 'number' ? item.duration : 0,
+      confidence: item.confidence || 'Weak',
+      transcript: item.transcript || '',
+      voteScore: typeof item.voteScore === 'number' ? item.voteScore : 0,
+      matchVariant: item.matchVariant,
+    };
+
+    migrated.push(stored);
+    hydrated.push({
+      ...stored,
+      url: URL.createObjectURL(blob),
+      timestamp: new Date(stored.timestamp),
+    });
+  }
+
+  return { hydrated, migrated, deletedIds };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -179,6 +250,11 @@ export async function exportRecordingsAsZip(
   if (!recordings.length) {
     throw new Error('No recordings to export');
   }
+
+  const [{ default: JSZip }, { saveAs }] = await Promise.all([
+    import('jszip'),
+    import('file-saver'),
+  ]);
 
   const zip = new JSZip();
   let csv =

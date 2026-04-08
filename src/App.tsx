@@ -34,8 +34,6 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import JSZip from 'jszip';
-import { saveAs } from 'file-saver';
 import {
   Mic, Settings, Play, Trash2,
   Radio, Clock, Activity, Download, AlertCircle,
@@ -47,23 +45,23 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { Toaster, toast } from 'sonner';
 import { format } from 'date-fns';
-import * as db from './utils/db';
+import * as db from './lib/storage/db';
 
 // ⚡ PERFORMANCE OPTIMIZATIONS: Import utilities
-import { phoneticEngine } from './utils/phoneticCache';
-import type { PhoneticSignature } from './utils/optimizedVoting';
-import { ManagedURLPool, BoundedQueue, CleanupRegistry, createDebounce, createThrottle } from './utils/memoryManagement';
-import { voteOnHypotheses_OPTIMIZED as voteOnHypotheses_OLD, matchTranscriptToKeyword_OPTIMIZED, getFilteredAndSortedRecordings } from './utils/optimizedFunctions';
-import { voteOnHypotheses_OPTIMIZED, normalizeFast, preWarmLevenshteinCache } from './utils/optimizedVoting';
-import { URLPool } from './utils/urlPool';
+import { phoneticEngine } from './lib/performance/phoneticCache';
+import type { PhoneticSignature } from './lib/performance/optimizedVoting';
+import { ManagedURLPool, BoundedQueue, CleanupRegistry, createDebounce, createThrottle } from './lib/performance/memoryManagement';
+import { voteOnHypotheses_OPTIMIZED as voteOnHypotheses_OLD, matchTranscriptToKeyword_OPTIMIZED, getFilteredAndSortedRecordings } from './lib/performance/optimizedFunctions';
+import { voteOnHypotheses_OPTIMIZED, normalizeFast, preWarmLevenshteinCache } from './lib/performance/optimizedVoting';
+import { URLPool } from './lib/media/urlPool';
 
 // 🚀 PHASE 2: Import new hooks & services
-import { useAudioBuffer } from './hooks/useAudioBuffer';
-import { useKeywordDetection } from './hooks/useKeywordDetection';
-import { useRecordingManager } from './hooks/useRecordingManager';
-import { useVisualization } from './hooks/useVisualization';
-import type { Confidence } from './services/detectionService';
-import type { Recording, KeywordStat } from './services/recordingService';
+import { useAudioBuffer } from './features/audio/hooks/useAudioBuffer';
+import { useKeywordDetection } from './features/detection/hooks/useKeywordDetection';
+import { useRecordingManager } from './features/recordings/hooks/useRecordingManager';
+import { useVisualization } from './features/audio/hooks/useVisualization';
+import type { Confidence } from './features/detection/services/detectionService';
+import type { Recording, KeywordStat } from './features/recordings/services/recordingService';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types (App-specific)
@@ -506,8 +504,15 @@ const blobToBase64 = (b: Blob): Promise<string> => new Promise((res,rej)=>{const
 const base64ToBlob = async (b64: string): Promise<Blob> => { const r=await fetch(b64);return r.blob(); };
 const DEFAULT_VOSK_MODEL_URL = '/models/vosk-model-small-en-us-0.15.tar.gz';
 const toStoredRecording = (recording: Recording): StoredRecording => ({
-  ...recording,
+  id: recording.id,
+  blob: recording.blob,
   timestamp: recording.timestamp.toISOString(),
+  triggerWord: recording.triggerWord,
+  duration: recording.duration,
+  confidence: recording.confidence,
+  transcript: recording.transcript,
+  voteScore: recording.voteScore,
+  matchVariant: recording.matchVariant,
 });
 const hydrateStoredRecordings = (items: StoredRecording[]): Recording[] =>
   items.map((item) => ({
@@ -762,6 +767,12 @@ export default function App() {
   // Theme
   useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark');
+    document.documentElement.classList.toggle('light', theme === 'light');
+    document.body.classList.toggle('dark', theme === 'dark');
+    document.body.classList.toggle('light', theme === 'light');
+    document.documentElement.style.colorScheme = theme;
+    document.body.style.backgroundColor = theme === 'dark' ? '#0f1117' : '#f8f9fc';
+    document.body.style.color = theme === 'dark' ? '#f4f7fb' : '#0f1117';
     localStorage.setItem('theme', theme);
   }, [theme]);
 
@@ -915,7 +926,7 @@ export default function App() {
         noiseCalibQueueRef.current.clear();
       } catch {}
     };
-  }, [recordingMgr.recordings]);
+  }, []);
 
   // Mic devices
   useEffect(() => {
@@ -1151,12 +1162,6 @@ export default function App() {
           appendDebug(`Circular buffer extraction failed: ${e}; using fallback blob`);
         }
       }
-      const url = URL.createObjectURL(finalBlob);
-      const rec: Recording = {
-        id: Math.random().toString(36).slice(2,11), blob: finalBlob, url,
-        timestamp: new Date(), triggerWord, duration: durationSec, confidence, transcript, voteScore, matchVariant: variant
-      };
-      
       // 🔴 BUG FIX #2: Use recordingMgr hook to save recording with proper error handling
       await recordingMgr.addRecording(finalBlob, triggerWord, durationSec, confidence, transcript, voteScore, variant);
       appendDebug(`✓ Recording saved: "${triggerWord}" ${(voteScore*100).toFixed(0)}% (${confidence})`);
@@ -1672,19 +1677,7 @@ export default function App() {
   };
 
   const exportZip = async () => {
-    const toExp = (recordingMgr?.selectedRecordingIds?.size || 0) > 0 ? (recordingMgr?.recordings || []).filter(r=>recordingMgr?.selectedRecordingIds?.has(r.id)) : (recordingMgr?.recordings || []);
-    if (!toExp.length) return;
-    const zip = new JSZip();
-    let csv = 'ID,Keyword,Duration(s),Timestamp,Confidence,VoteScore,MatchVariant,Transcript\n';
-    toExp.forEach(r => {
-      zip.file(`ad_${r.triggerWord}_${r.id}.wav`, r.blob);
-      csv += `${r.id},"${r.triggerWord}",${r.duration.toFixed(1)},${r.timestamp.toISOString()},${r.confidence},${r.voteScore.toFixed(2)},"${r.matchVariant||''}","${(r.transcript||'').replace(/"/g,'""')}"\n`;
-    });
-    zip.file('metadata.csv', csv);
-    const content = await zip.generateAsync({type:'blob'});
-    saveAs(content, `ad_captures_${format(new Date(),'yyyy-MM-dd_HH-mm')}.zip`);
-    toast.success(`Exported ${toExp.length} recordings`);
-    recordingMgr.setSelectedRecordingIds(new Set());
+    await recordingMgr.exportAsZip(`ad_captures_${format(new Date(),'yyyy-MM-dd_HH-mm')}.zip`);
   };
 
   // ⚡ OPTIMIZATION 1: Memoize expensive computed values
@@ -1740,7 +1733,7 @@ export default function App() {
 
   // 🔴 BUG #7 FIX: Proper URL management for downloads to prevent leaks
   const downloadRecording = useCallback((rec: Recording) => {
-    const u = urlPoolRef.current.getOrCreateURL(rec.blob);
+    const u = urlPoolRef.current.getOrCreateURL(rec.blob, rec.id);
     try {
       const a = document.createElement('a');
       a.href = u;
@@ -1761,20 +1754,47 @@ export default function App() {
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <div className="min-h-screen bg-[#0f1117] text-zinc-100 font-sans" style={{fontFamily:"'DM Sans', system-ui, sans-serif"}}>
+    <div
+      className={`${theme} min-h-screen font-sans transition-colors duration-200`}
+      style={{
+        fontFamily:"'DM Sans', system-ui, sans-serif",
+        backgroundColor: theme === 'dark' ? '#0f1117' : '#f8f9fc',
+        color: theme === 'dark' ? '#f4f7fb' : '#0f1117',
+      }}
+    >
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
         :root { --accent: #3b82f6; --accent-glow: rgba(59,130,246,0.15); }
         .dark { color-scheme: dark; }
-        .light { background: #f8f9fc; color: #0f1117; }
+        .light { color-scheme: light; background: #f8f9fc; color: #0f1117; }
         .light .bg-\\[\\#0f1117\\] { background: #f8f9fc; }
+        .light .bg-\\[\\#0f1117\\]\\/90 { background: rgba(248,249,252,0.92); }
+        .light .bg-\\[\\#13151d\\] { background: #ffffff; }
+        .light .bg-\\[\\#161820\\] { background: #ffffff; }
         .light .bg-zinc-900 { background: white; }
+        .light .bg-zinc-900\\/97 { background: rgba(255,255,255,0.97); }
         .light .bg-zinc-800 { background: #f1f3f7; }
+        .light .bg-zinc-800\\/60 { background: rgba(241,243,247,0.8); }
+        .light .bg-zinc-800\\/50 { background: rgba(241,243,247,0.74); }
+        .light .bg-zinc-800\\/40 { background: rgba(241,243,247,0.6); }
+        .light .bg-zinc-950 { background: #edf2f7; }
+        .light .bg-zinc-950\\/30 { background: rgba(237,242,247,0.8); }
+        .light .bg-zinc-700 { background: #e4e9f2; }
         .light .border-zinc-800 { border-color: #e2e6ef; }
+        .light .border-zinc-700 { border-color: #d7deea; }
+        .light .border-zinc-700\\/50 { border-color: rgba(215,222,234,0.8); }
+        .light .border-zinc-700\\/40 { border-color: rgba(215,222,234,0.72); }
         .light .text-zinc-400 { color: #6b7280; }
         .light .text-zinc-300 { color: #374151; }
+        .light .text-zinc-200 { color: #1f2937; }
         .light .text-zinc-100 { color: #111827; }
+        .light .text-zinc-700 { color: #9ca3af; }
+        .light .text-zinc-600 { color: #6b7280; }
+        .light .text-zinc-500 { color: #4b5563; }
         .light .bg-\\[\\#0d0e14\\] { background: #f1f3f7; }
+        .light .hover\\:bg-zinc-800:hover { background: #e9edf5; }
+        .light .hover\\:bg-zinc-700:hover { background: #dde5f0; }
+        .light .hover\\:text-zinc-400:hover { color: #374151; }
         .vad-ring { box-shadow: 0 0 0 3px rgba(59,130,246,0.3), 0 0 20px rgba(59,130,246,0.1); }
         .rec-ring { box-shadow: 0 0 0 3px rgba(239,68,68,0.4), 0 0 24px rgba(239,68,68,0.15); }
         .mono { font-family: 'DM Mono', monospace; }
@@ -1817,7 +1837,11 @@ export default function App() {
       </AnimatePresence>
 
       {/* Header */}
-      <header className="border-b border-zinc-800/60 sticky top-0 z-20 backdrop-blur-md bg-[#0f1117]/90">
+      <header className={`border-b sticky top-0 z-20 backdrop-blur-md transition-colors ${
+        theme === 'dark'
+          ? 'border-zinc-800/60 bg-[#0f1117]/90'
+          : 'border-zinc-200/80 bg-[#f8f9fc]/92'
+      }`}>
         <div className="max-w-6xl mx-auto px-4 min-h-14 py-2 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0">
             <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center">
@@ -1828,12 +1852,24 @@ export default function App() {
           </div>
           <div className="flex items-center gap-1 sm:gap-2 shrink-0">
             <button onClick={()=>setShowDebug(!showDebug)}
-              className={`p-2 rounded-lg transition-colors ${showDebug?'bg-zinc-700 text-zinc-200':'hover:bg-zinc-800 text-zinc-500'}`}
+              className={`p-2 rounded-lg transition-colors ${
+                showDebug
+                  ? theme === 'dark'
+                    ? 'bg-zinc-700 text-zinc-200'
+                    : 'bg-blue-100 text-blue-700'
+                  : 'hover:bg-zinc-800 text-zinc-500'
+              }`}
               title="Detection Log">
               <Eye size={16} />
             </button>
             <button onClick={()=>setShowStats(!showStats)}
-              className={`p-2 rounded-lg transition-colors ${showStats?'bg-zinc-700 text-zinc-200':'hover:bg-zinc-800 text-zinc-500'}`}
+              className={`p-2 rounded-lg transition-colors ${
+                showStats
+                  ? theme === 'dark'
+                    ? 'bg-zinc-700 text-zinc-200'
+                    : 'bg-blue-100 text-blue-700'
+                  : 'hover:bg-zinc-800 text-zinc-500'
+              }`}
               title="Stats">
               <BarChart2 size={16} />
             </button>
@@ -1844,16 +1880,24 @@ export default function App() {
               {isOnline ? <Wifi size={16} /> : <WifiOff size={16} />}
             </div>
 
-            <button onClick={()=>setTheme(t=>t==='dark'?'light':'dark')}
-              className="p-2 rounded-lg hover:bg-zinc-800 text-zinc-500 transition-colors">
+            <button
+              onClick={()=>setTheme(t=>t==='dark'?'light':'dark')}
+              className={`p-2 rounded-lg transition-colors ${
+                theme === 'dark'
+                  ? 'hover:bg-zinc-800 text-zinc-500'
+                  : 'hover:bg-zinc-200 text-zinc-600'
+              }`}
+              title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+              aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+            >
               {theme==='dark'?<Sun size={16}/>:<Moon size={16}/>}
             </button>
             <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium ${
               isRecording ? 'bg-red-500/10 text-red-400 border border-red-500/20' :
               isListening && !isPaused ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' :
               isPaused ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' :
-              'bg-zinc-800 text-zinc-500'}`}>
-              <div className={`w-1.5 h-1.5 rounded-full ${isRecording?'bg-red-500 animate-pulse':isListening&&!isPaused?'bg-blue-500 animate-pulse':isPaused?'bg-amber-500':'bg-zinc-600'}`} />
+              theme === 'dark' ? 'bg-zinc-800 text-zinc-500' : 'bg-white border border-zinc-200 text-zinc-600 shadow-sm'}`}>
+              <div className={`w-1.5 h-1.5 rounded-full ${isRecording?'bg-red-500 animate-pulse':isListening&&!isPaused?'bg-blue-500 animate-pulse':isPaused?'bg-amber-500':theme === 'dark' ? 'bg-zinc-600' : 'bg-zinc-400'}`} />
               <span className="hidden sm:inline">{isRecording?'Recording':isListening&&!isPaused?'Monitoring':isPaused?'Paused':'Standby'}</span>
             </div>
           </div>

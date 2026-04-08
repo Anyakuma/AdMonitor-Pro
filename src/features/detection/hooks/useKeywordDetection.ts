@@ -5,7 +5,7 @@
 
 import { useCallback, useRef, useState } from 'react';
 import * as detectionService from '../services/detectionService';
-import type { PhoneticSignature } from '../utils/phoneticCache';
+import type { PhoneticSignature } from '../../../lib/performance/phoneticCache';
 
 export interface DetectionResult {
   matched: boolean;

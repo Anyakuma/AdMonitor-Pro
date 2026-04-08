@@ -2,7 +2,7 @@ import {Component, StrictMode, type ReactNode} from 'react';
 import {createRoot} from 'react-dom/client';
 import App from './App.tsx';
 import './index.css';
-import { initializeDB } from './utils/db';
+import { initializeDB } from './lib/storage/db';
 
 class FatalErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
   declare props: { children: ReactNode };

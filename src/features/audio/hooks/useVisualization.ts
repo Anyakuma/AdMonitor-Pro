@@ -5,7 +5,7 @@
 
 import { useState, useRef, useCallback } from 'react';
 import * as audioService from '../services/audioService';
-import { createThrottle } from '../utils/memoryManagement';
+import { createThrottle } from '../../../lib/performance/memoryManagement';
 
 export interface UseVisualizationOptions {
   fftBins?: number;

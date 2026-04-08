@@ -6,7 +6,7 @@
  */
 
 import type { PhoneticSignature } from './phoneticCache';
-import type { Confidence } from '../services/detectionService';
+import type { Confidence } from '../../features/detection/services/detectionService';
 
 /**
  * ORIGINAL voteOnHypotheses (INEFFICIENT)

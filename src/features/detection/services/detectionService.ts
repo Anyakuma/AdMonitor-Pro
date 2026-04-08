@@ -3,7 +3,7 @@
  * Extracted from App.tsx to improve reusability and testability
  */
 
-import type { PhoneticSignature } from '../utils/phoneticCache';
+import type { PhoneticSignature } from '../../../lib/performance/phoneticCache';
 
 export type Confidence = 'Strong' | 'Good' | 'Weak';
 export type SoundexCode = string;

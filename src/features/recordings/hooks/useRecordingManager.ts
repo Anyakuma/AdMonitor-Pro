@@ -336,7 +336,9 @@ export function useRecordingManager(options: UseRecordingManagerOptions = {}) {
     }
   }, [handleError]);
 
-  return {
+  // ⚡ OPTIMIZATION: Memoize the returned object so it's stable across renders
+  // This prevents infinite loops when recordingMgr is used in dependency arrays
+  const memoizedMgr = useMemo(() => ({
     // State
     recordings,
     selectedRecordingIds,
@@ -348,7 +350,7 @@ export function useRecordingManager(options: UseRecordingManagerOptions = {}) {
     setRecordings,
     setSelectedRecordingIds,
 
-    // Methods
+    // Methods (all memoized with useCallback, so stable)
     addRecording,
     loadRecordings,
     deleteRecording,
@@ -361,5 +363,23 @@ export function useRecordingManager(options: UseRecordingManagerOptions = {}) {
 
     // Memoized helpers
     memoizedFiltered,
-  };
+  }), [
+    recordings,
+    selectedRecordingIds,
+    isLoading,
+    error,
+    keywordStats,
+    addRecording,
+    loadRecordings,
+    deleteRecording,
+    deleteMultiple,
+    getFiltered,
+    toggleSelection,
+    toggleSelectAll,
+    exportAsZip,
+    downloadRecording,
+    memoizedFiltered,
+  ]);
+
+  return memoizedMgr;
 }

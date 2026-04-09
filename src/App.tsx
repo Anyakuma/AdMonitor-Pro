@@ -62,6 +62,7 @@ import { useRecordingManager } from './features/recordings/hooks/useRecordingMan
 import { useVisualization } from './features/audio/hooks/useVisualization';
 import type { Confidence } from './features/detection/services/detectionService';
 import type { Recording, KeywordStat } from './features/recordings/services/recordingService';
+import * as recordingService from './features/recordings/services/recordingService';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types (App-specific)
@@ -503,23 +504,8 @@ const getSupportedMimeType = (): string => {
 const blobToBase64 = (b: Blob): Promise<string> => new Promise((res,rej)=>{const r=new FileReader();r.onloadend=()=>res(r.result as string);r.onerror=rej;r.readAsDataURL(b);});
 const base64ToBlob = async (b64: string): Promise<Blob> => { const r=await fetch(b64);return r.blob(); };
 const DEFAULT_VOSK_MODEL_URL = '/models/vosk-model-small-en-us-0.15.tar.gz';
-const toStoredRecording = (recording: Recording): StoredRecording => ({
-  id: recording.id,
-  blob: recording.blob,
-  timestamp: recording.timestamp.toISOString(),
-  triggerWord: recording.triggerWord,
-  duration: recording.duration,
-  confidence: recording.confidence,
-  transcript: recording.transcript,
-  voteScore: recording.voteScore,
-  matchVariant: recording.matchVariant,
-});
-const hydrateStoredRecordings = (items: StoredRecording[]): Recording[] =>
-  items.map((item) => ({
-    ...item,
-    url: URL.createObjectURL(item.blob),
-    timestamp: new Date(item.timestamp),
-  }));
+// 🔴 BUG FIX: Removed duplicate toStoredRecording and hydrateStoredRecordings functions
+// These are now properly imported from recordingService with async blob serialization
 const buildKeywordStats = (items: Recording[]): Record<string, KeywordStat> => {
   const stats: Record<string, KeywordStat> = {};
 
@@ -617,7 +603,10 @@ export default function App() {
   // ────────────────────────────────────────────────────────────────────────
   const audioBuffer = useAudioBuffer();
   const keywordDetection = useKeywordDetection({ cooldownMs: 10_000, sensitivityLevel: sensitivity });
-  const recordingMgr = useRecordingManager();
+  const recordingMgr = useRecordingManager({
+    onSuccess: (msg: string) => toast.success(msg),
+    onError: (err: Error) => toast.error(err.message),
+  });
   const visualization = useVisualization();
 
   // ⚡ OPTIMIZATION 7: Consolidate ref-syncing useEffects into ONE
@@ -808,15 +797,7 @@ export default function App() {
       mobileMedia.addEventListener('change', syncIsMobile);
       coarseMedia.addEventListener('change', syncIsMobile);
     } else {
-      // Mic/speech APIs require a secure context on non-localhost origins.
-      if (!window.isSecureContext) {
-        const secureMsg = 'This feature requires HTTPS on non-localhost devices. Open the app via https://... or localhost.';
-        setError(secureMsg);
-        toast.error(secureMsg);
-        return;
-      }
-
-      // Safari < 14 fallback
+      // Safari < 14 fallback: use deprecated addListener API
       mobileMedia.addListener(syncIsMobile);
       coarseMedia.addListener(syncIsMobile);
     }
@@ -959,7 +940,6 @@ export default function App() {
       } catch {}
 
       try {
-        console.log('I am here')
         const [kw,rec] = await Promise.all([fetch('/api/keywords'),fetch('/api/recordings')]);
         if (kw.ok) {
           const nextKeywords = await kw.json();
@@ -979,10 +959,12 @@ export default function App() {
               transcript:r.transcript||'', voteScore:r.voteScore||0, matchVariant:r.matchVariant };
           }));
           if (!cancelled) {
-            // Recordings now managed by recordingMgr hook
+            // 🔴 BUG FIX: Serialize recordings to base64 before storing in IndexedDB
+            // Use recordingService.toStoredRecording which now properly converts Blob to audioBase64
             await db.clear(db.STORES.RECORDINGS);
             for (const item of parsed) {
-              await db.put(db.STORES.RECORDINGS, toStoredRecording(item));
+              const stored = await recordingService.toStoredRecording(item);
+              await db.put(db.STORES.RECORDINGS, stored);
             }
           }
         }
@@ -1519,6 +1501,7 @@ export default function App() {
               const blob = new Blob(rollingBufRef.current, { type: mr.mimeType });
               try {
                 // Call async saveRecording without blocking (fire and forget with .catch)
+                // 🔴 BUG FIX: Don't show success toast yet - wait for async save to complete
                 saveRecording(blob, currentTrigRef.current, totalDuration, currentConfRef.current, currentTransRef.current, currentVoteRef.current, currentVariantRef.current)
                   .catch((err) => {
                     const errMsg = err instanceof Error ? err.message : String(err);
@@ -1530,10 +1513,11 @@ export default function App() {
                 const errMsg = err instanceof Error ? err.message : String(err);
                 console.error(`Sync save error: ${errMsg}`);
                 appendDebug(`Sync save error: ${errMsg}`);
+                toast.error('Recording capture failed');
               }
               rollingBufRef.current = [];
               setIsRecording(false);
-              toast.success('Recording complete & saved. (30s pre + 30s post)');
+              // ✅ Success toast is now handled by saveRecording via recordingMgr.addRecording success path
             }
           } else {
             // Keep roughly PRE_TRIGGER_SEC of fallback MediaRecorder chunks.

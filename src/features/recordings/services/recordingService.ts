@@ -20,8 +20,9 @@ export interface Recording {
 }
 
 export interface StoredRecording
-  extends Omit<Recording, 'url' | 'timestamp'> {
+  extends Omit<Recording, 'url' | 'timestamp' | 'blob'> {
   timestamp: string;
+  audioBase64: string;  // Blob serialized as base64 for IndexedDB
 }
 
 export interface LegacyStoredRecording {
@@ -49,10 +50,12 @@ export interface KeywordStat {
 // Serialization Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function toStoredRecording(recording: Recording): StoredRecording {
+export async function toStoredRecording(recording: Recording): Promise<StoredRecording> {
+  // Convert Blob to base64 for IndexedDB storage (Blobs cannot be directly serialized)
+  const audioBase64 = await blobToBase64(recording.blob);
   return {
     id: recording.id,
-    blob: recording.blob,
+    audioBase64,
     timestamp: recording.timestamp.toISOString(),
     triggerWord: recording.triggerWord,
     duration: recording.duration,
@@ -63,22 +66,35 @@ export function toStoredRecording(recording: Recording): StoredRecording {
   };
 }
 
-export function hydrateStoredRecordings(items: StoredRecording[]): Recording[] {
-  return items.flatMap((item) => {
-    if (!(item.blob instanceof Blob)) {
-      console.warn(
-        '[recordingService] Skipping legacy or malformed recording without blob payload:',
-        item.id
-      );
-      return [];
+export async function hydrateStoredRecordings(items: StoredRecording[]): Promise<Recording[]> {
+  const results: Recording[] = [];
+  
+  for (const item of items) {
+    try {
+      if (!item.audioBase64) {
+        console.warn('[recordingService] Skipping recording without audioBase64:', item.id);
+        continue;
+      }
+      
+      const blob = await base64ToBlob(item.audioBase64);
+      results.push({
+        id: item.id,
+        blob,
+        url: URL.createObjectURL(blob),
+        timestamp: new Date(item.timestamp),
+        triggerWord: item.triggerWord,
+        duration: item.duration,
+        confidence: item.confidence,
+        transcript: item.transcript,
+        voteScore: item.voteScore,
+        matchVariant: item.matchVariant,
+      });
+    } catch (error) {
+      console.warn('[recordingService] Failed to hydrate recording:', item.id, error);
     }
-
-    return [{
-      ...item,
-      url: URL.createObjectURL(item.blob),
-      timestamp: new Date(item.timestamp),
-    }];
-  });
+  }
+  
+  return results;
 }
 
 export interface NormalizedRecordingsResult {
@@ -110,24 +126,30 @@ export async function normalizeStoredRecordings(
       continue;
     }
 
-    const stored: StoredRecording = {
-      id: item.id,
-      blob,
-      timestamp: item.timestamp || new Date(0).toISOString(),
-      triggerWord: item.triggerWord || 'unknown',
-      duration: typeof item.duration === 'number' ? item.duration : 0,
-      confidence: item.confidence || 'Weak',
-      transcript: item.transcript || '',
-      voteScore: typeof item.voteScore === 'number' ? item.voteScore : 0,
-      matchVariant: item.matchVariant,
-    };
+    try {
+      const stored: StoredRecording = {
+        id: item.id,
+        audioBase64: item.audioBase64 || await blobToBase64(blob),
+        timestamp: item.timestamp || new Date(0).toISOString(),
+        triggerWord: item.triggerWord || 'unknown',
+        duration: typeof item.duration === 'number' ? item.duration : 0,
+        confidence: item.confidence || 'Weak',
+        transcript: item.transcript || '',
+        voteScore: typeof item.voteScore === 'number' ? item.voteScore : 0,
+        matchVariant: item.matchVariant,
+      };
 
-    migrated.push(stored);
-    hydrated.push({
-      ...stored,
-      url: URL.createObjectURL(blob),
-      timestamp: new Date(stored.timestamp),
-    });
+      migrated.push(stored);
+      hydrated.push({
+        ...stored,
+        blob,
+        url: URL.createObjectURL(blob),
+        timestamp: new Date(stored.timestamp),
+      } as unknown as Recording);
+    } catch (error) {
+      console.warn('[recordingService] Failed to normalize recording:', item.id, error);
+      deletedIds.push(item.id);
+    }
   }
 
   return { hydrated, migrated, deletedIds };
@@ -157,9 +179,13 @@ export async function base64ToBlob(b64: string): Promise<Blob> {
 
 export async function saveRecordingToDatabase(recording: Recording): Promise<void> {
   try {
-    await db.put(db.STORES.RECORDINGS, toStoredRecording(recording));
+    // Convert blob to base64 for IndexedDB storage (Blobs are not serializable)
+    const stored = await toStoredRecording(recording);
+    await db.put(db.STORES.RECORDINGS, stored);
   } catch (e) {
-    console.warn('Failed to save recording to IndexedDB:', e);
+    const errMsg = e instanceof Error ? e.message : String(e);
+    console.error('[recordingService] Failed to save recording to IndexedDB:', errMsg);
+    throw new Error(`Database save failed: ${errMsg}`);
   }
 }
 

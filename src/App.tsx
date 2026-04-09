@@ -557,7 +557,6 @@ export default function App() {
   // Fixed 30 s pre-trigger + 30 s post-trigger = 60 s total per recording
   const PRE_TRIGGER_SEC  = 30;
   const POST_TRIGGER_SEC = 30;
-  const POST_CHUNKS      = POST_TRIGGER_SEC * 4; // 250 ms chunks
 
   const [playingId,         setPlayingId]          = useState<string | null>(null);
   const [playProgress,      setPlayProgress]       = useState<Record<string,number>>({});
@@ -573,7 +572,7 @@ export default function App() {
       const saved = localStorage.getItem('detectorMode');
       if (saved === 'browser' || saved === 'hybrid-preferred' || saved === 'hybrid-required') return saved;
     }
-    return 'browser';  // Default to browser-only to avoid loading Vosk by default
+    return 'hybrid-required';
   });
   const [voskModelUrl,      setVoskModelUrl]       = useState<string>(() => {
     if (typeof window !== 'undefined') {
@@ -732,6 +731,9 @@ export default function App() {
   const streamRef         = useRef<MediaStream | null>(null);
   const rollingBufRef     = useRef<Blob[]>([]);
   const postTriggerRef    = useRef(0);
+  const chunkIntervalMsRef = useRef(250);
+  const postTriggerTargetChunksRef = useRef(Math.ceil((POST_TRIGGER_SEC * 1000) / 250));
+  const preTriggerTargetChunksRef = useRef(Math.ceil((PRE_TRIGGER_SEC * 1000) / 250));
   const audioCtxRef       = useRef<AudioContext | null>(null);
   const analyserRef       = useRef<AnalyserNode | null>(null);
   const animFrameRef      = useRef<number | null>(null);
@@ -748,6 +750,7 @@ export default function App() {
   const recordStartRef    = useRef(0);
   const voskModelRef       = useRef<any>(null);
   const voskRecognizerRef  = useRef<any>(null);
+  const voskModelLoadPromiseRef = useRef<Promise<any> | null>(null);
   const webSpeechHitRef    = useRef<SourceDetection | null>(null);
   const voskHitRef         = useRef<SourceDetection | null>(null);
   const expandedMapRef     = useRef<Map<string, string[]>>(new Map()); // 🔴 BUG #1
@@ -1000,10 +1003,11 @@ export default function App() {
     try { voskModelRef.current?.terminate?.(); } catch {}
     voskRecognizerRef.current = null;
     voskModelRef.current = null;
+    voskModelLoadPromiseRef.current = null;
     voskHitRef.current = null;
     setVoskPartial('');
     setVoskStatus('disabled');
-  }, [voskModelUrl]);
+  }, []);
 
   // ── Voice Activity Detection (RMS-based) ────────────────────────────────
   const rmsRef = useRef(0);
@@ -1170,7 +1174,7 @@ export default function App() {
       appendDebug(`✗ Recording save failed: ${errMsg}`);
       toast.error(`Failed to save recording: ${errMsg}`);
     }
-  }, [appendDebug]);
+  }, [appendDebug, recordingMgr]);
 
   // ── Trigger detection ────────────────────────────────────────────────────
   const triggerRecording = useCallback((
@@ -1201,7 +1205,7 @@ export default function App() {
       time: Date.now(),
       bufLen: circBufRef.current?.length || 0
     };
-    postTriggerRef.current    = POST_CHUNKS;            // exactly 30 s of post-trigger
+    postTriggerRef.current    = postTriggerTargetChunksRef.current;
     setIsRecording(true);
     setLastDetected(word);
     appendDebug(`TRIGGER "${word}" | ${confidence} | vote=${(voteScore*100).toFixed(0)}% | variant="${variant}"`);
@@ -1286,6 +1290,33 @@ export default function App() {
     }
   }, [appendDebug, maybeTriggerFromSources]);
 
+  const preloadVoskModel = useCallback(async () => {
+    const modelUrl = voskModelUrl.trim();
+    if (!modelUrl) return null;
+
+    if (voskModelRef.current) return voskModelRef.current;
+    if (voskModelLoadPromiseRef.current) return voskModelLoadPromiseRef.current;
+
+    const loadPromise = (async () => {
+      appendDebug(`Preloading Vosk model from ${modelUrl}`);
+      const { createModel } = await import('vosk-browser');
+      const model = await createModel(modelUrl);
+      voskModelRef.current = model;
+      appendDebug('Vosk model preloaded');
+      return model;
+    })();
+
+    voskModelLoadPromiseRef.current = loadPromise;
+    try {
+      return await loadPromise;
+    } catch (error) {
+      console.error('Vosk model preload failed', error);
+      return null;
+    } finally {
+      voskModelLoadPromiseRef.current = null;
+    }
+  }, [appendDebug, voskModelUrl]);
+
   const initVoskRecognizer = useCallback(async (sampleRate: number) => {
     const modelUrl = voskModelUrl.trim();
     if (!modelUrl) {
@@ -1296,9 +1327,8 @@ export default function App() {
 
     try {
       setVoskStatus('loading');
-      appendDebug(`Loading Vosk model from ${modelUrl}`);
-      const { createModel } = await import('vosk-browser');
-      const model = await createModel(modelUrl);
+      const model = (await preloadVoskModel()) || voskModelRef.current;
+      if (!model) throw new Error('Vosk model unavailable');
       const recognizer = new model.KaldiRecognizer(sampleRate);
       recognizer.setWords(true);
       recognizer.on('partialresult', (message: any) => {
@@ -1330,7 +1360,16 @@ export default function App() {
       // Silently fail - app continues with browser ASR only
       // Vosk is an optional enhancement, not required for operation
     }
-  }, [appendDebug, evaluateTranscriptSource, voskModelUrl]);
+  }, [appendDebug, evaluateTranscriptSource, preloadVoskModel, voskModelUrl]);
+
+  useEffect(() => {
+    if (detectorMode === 'browser') return;
+    if (!voskModelUrl.trim()) return;
+
+    preloadVoskModel().catch(() => {
+      // Best-effort warm preload only.
+    });
+  }, [detectorMode, preloadVoskModel, voskModelUrl]);
 
   const stopRecording = useCallback(() => {
     if (!isRecordingRef.current) return;
@@ -1464,7 +1503,10 @@ export default function App() {
         const mimeType = getSupportedMimeType();
         const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
         continuousRecRef.current = mr;
-        rollingBufRef.current = []; postTriggerRef.current = 0;
+        rollingBufRef.current = [];
+        postTriggerRef.current = 0;
+        preTriggerTargetChunksRef.current = Math.ceil((PRE_TRIGGER_SEC * 1000) / chunkIntervalMsRef.current);
+        postTriggerTargetChunksRef.current = Math.ceil((POST_TRIGGER_SEC * 1000) / chunkIntervalMsRef.current);
 
         mr.ondataavailable = (e) => {
           if (!e?.data?.size) return;
@@ -1494,13 +1536,16 @@ export default function App() {
               toast.success('Recording complete & saved. (30s pre + 30s post)');
             }
           } else {
-            // Pre-buffer rolling window: keep last 30 s = 120 chunks @ 250 ms
-            if (rollingBufRef.current.length > 120) rollingBufRef.current.shift();
+            // Keep roughly PRE_TRIGGER_SEC of fallback MediaRecorder chunks.
+            if (rollingBufRef.current.length > preTriggerTargetChunksRef.current) rollingBufRef.current.shift();
           }
         };
         
         // ── Mobile optimization: Adjust recording interval for lower CPU ────
         const recordingInterval = isMobile ? 500 : 250;  // 500ms on mobile (2x polls/sec), 250ms on desktop (4x polls/sec)
+        chunkIntervalMsRef.current = recordingInterval;
+        preTriggerTargetChunksRef.current = Math.ceil((PRE_TRIGGER_SEC * 1000) / recordingInterval);
+        postTriggerTargetChunksRef.current = Math.ceil((POST_TRIGGER_SEC * 1000) / recordingInterval);
         mr.start(recordingInterval);
 
         // Web Speech API

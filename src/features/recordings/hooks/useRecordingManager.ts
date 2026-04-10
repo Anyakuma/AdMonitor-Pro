@@ -22,19 +22,25 @@ export function useRecordingManager(options: UseRecordingManagerOptions = {}) {
   const [error, setError] = useState<string | null>(null);
   const recordingsRef = useRef<Recording[]>([]);
 
+  // ⚡ OPTIMIZATION: Keep options in a ref to avoid invalidating callbacks
+  const optionsRef = useRef(options);
+  useEffect(() => {
+    optionsRef.current = options;
+  }, [options]);
+
   const handleError = useCallback(
     (e: Error) => {
       setError(e.message);
-      options.onError?.(e);
+      optionsRef.current.onError?.(e);
     },
-    [options]
+    []
   );
 
   const handleSuccess = useCallback(
     (message: string) => {
-      options.onSuccess?.(message);
+      optionsRef.current.onSuccess?.(message);
     },
-    [options]
+    []
   );
 
   const revokeRecordingUrls = useCallback((items: Recording[]) => {

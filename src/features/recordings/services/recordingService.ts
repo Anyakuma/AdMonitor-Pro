@@ -20,9 +20,9 @@ export interface Recording {
 }
 
 export interface StoredRecording
-  extends Omit<Recording, 'url' | 'timestamp' | 'blob'> {
+  extends Omit<Recording, 'url' | 'timestamp'> {
   timestamp: string;
-  audioBase64: string;  // Blob serialized as base64 for IndexedDB
+  audioBase64?: string;  // Legacy fallback
 }
 
 export interface LegacyStoredRecording {
@@ -51,11 +51,9 @@ export interface KeywordStat {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function toStoredRecording(recording: Recording): Promise<StoredRecording> {
-  // Convert Blob to base64 for IndexedDB storage (Blobs cannot be directly serialized)
-  const audioBase64 = await blobToBase64(recording.blob);
   return {
     id: recording.id,
-    audioBase64,
+    blob: recording.blob,
     timestamp: recording.timestamp.toISOString(),
     triggerWord: recording.triggerWord,
     duration: recording.duration,
@@ -71,12 +69,16 @@ export async function hydrateStoredRecordings(items: StoredRecording[]): Promise
   
   for (const item of items) {
     try {
-      if (!item.audioBase64) {
-        console.warn('[recordingService] Skipping recording without audioBase64:', item.id);
+      let blob = item.blob;
+      if (!blob && item.audioBase64) {
+        blob = await base64ToBlob(item.audioBase64);
+      }
+      
+      if (!blob) {
+        console.warn('[recordingService] Skipping recording without blob or audioBase64:', item.id);
         continue;
       }
       
-      const blob = await base64ToBlob(item.audioBase64);
       results.push({
         id: item.id,
         blob,
@@ -129,7 +131,7 @@ export async function normalizeStoredRecordings(
     try {
       const stored: StoredRecording = {
         id: item.id,
-        audioBase64: item.audioBase64 || await blobToBase64(blob),
+        blob,
         timestamp: item.timestamp || new Date(0).toISOString(),
         triggerWord: item.triggerWord || 'unknown',
         duration: typeof item.duration === 'number' ? item.duration : 0,

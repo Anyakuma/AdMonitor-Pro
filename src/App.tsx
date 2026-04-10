@@ -974,7 +974,8 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [recordingMgr]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const appendDebug = useCallback((msg: string) => {
     setDebugLog(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 60));

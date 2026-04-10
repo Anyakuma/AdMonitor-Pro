@@ -1198,6 +1198,12 @@ export default function App() {
     isRecordingRef.current = true; // Prevent re-triggering before next render
     transcriptQueueRef.current.clear(); // Clear bounded queue to prevent false re-triggers on the same phrase
     voskTranscriptWindowRef.current = []; // Clear Vosk window as well
+    
+    // 🔥 CRITICAL FIX: Restart the SpeechRecognition engine entirely to clear `event.results` history
+    // Without this, the continuous results window STILL contains the triggered word for the next 30+ seconds,
+    // which immediately causes a re-trigger loop the moment recording stops.
+    try { recognitionRef.current?.stop(); } catch (e) {}
+    
     setLastDetected(word);
     appendDebug(`TRIGGER "${word}" | ${confidence} | vote=${(voteScore*100).toFixed(0)}% | variant="${variant}"`);
     toast.success(`🎯 "${word}" detected (${confidence}, ${(voteScore*100).toFixed(0)}% votes). Saving 30s pre + 30s post…`);
@@ -1371,6 +1377,7 @@ export default function App() {
     saveRecording(blob, currentTrigRef.current, totalDuration, currentConfRef.current, currentTransRef.current, currentVoteRef.current, currentVariantRef.current);
     rollingBufRef.current = [];
     setIsRecording(false);
+    isRecordingRef.current = false;
     toast.success(`Stopped & saved. (30s pre + ${postElapsed.toFixed(0)}s post)`);
   }, [saveRecording]);
 
@@ -1526,6 +1533,7 @@ export default function App() {
               }
               rollingBufRef.current = [];
               setIsRecording(false);
+              isRecordingRef.current = false;
               // ✅ Success toast is now handled by saveRecording via recordingMgr.addRecording success path
             }
           } else {

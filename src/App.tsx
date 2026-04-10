@@ -1124,17 +1124,14 @@ export default function App() {
       if (circBufRef.current && audioCtxRef.current && triggerContextRef.current) {
         const trigCtx = triggerContextRef.current;
         const bufLen = circBufRef.current.length;
-        
         // Safety check: calculate if buffer has wrapped too many times since trigger
         const timeSinceTrigger = Date.now() - trigCtx.time;
         const bufDurationMs = (bufLen / audioCtxRef.current.sampleRate) * 1000; // milliseconds covered by buffer
         const wrapsEstimate = timeSinceTrigger / bufDurationMs;
-        
         // If more than 1.5 wraps estimated, data may be corrupted; be conservative
         if (wrapsEstimate > 1.5) {
           appendDebug(`Warning: Circular buffer may have wrapped ${wrapsEstimate.toFixed(1)}x; audio may be incomplete`);
         }
-        
         try {
           finalBlob = circularToWAV(
             circBufRef.current,
@@ -1148,6 +1145,15 @@ export default function App() {
           appendDebug(`Circular buffer extraction failed: ${e}; using fallback blob`);
         }
       }
+
+      // --- ADDED: Validate blob before saving ---
+      if (!finalBlob || !(finalBlob instanceof Blob) || finalBlob.size < 1024) {
+        const msg = `Recording not saved: blob is ${finalBlob ? finalBlob.size : 0} bytes (${finalBlob && finalBlob.type ? finalBlob.type : 'unknown type'})`;
+        appendDebug(msg);
+        toast.error('Recording failed: No audio data was captured.');
+        return;
+      }
+      appendDebug(`Saving recording: blob size = ${finalBlob.size} bytes, type = ${finalBlob.type}`);
       // 🔴 BUG FIX #2: Use recordingMgr hook to save recording with proper error handling
       await recordingMgr.addRecording(finalBlob, triggerWord, durationSec, confidence, transcript, voteScore, variant);
       appendDebug(`✓ Recording saved: "${triggerWord}" ${(voteScore*100).toFixed(0)}% (${confidence})`);
@@ -1189,6 +1195,9 @@ export default function App() {
     };
     postTriggerRef.current    = postTriggerTargetChunksRef.current;
     setIsRecording(true);
+    isRecordingRef.current = true; // Prevent re-triggering before next render
+    transcriptQueueRef.current.clear(); // Clear bounded queue to prevent false re-triggers on the same phrase
+    voskTranscriptWindowRef.current = []; // Clear Vosk window as well
     setLastDetected(word);
     appendDebug(`TRIGGER "${word}" | ${confidence} | vote=${(voteScore*100).toFixed(0)}% | variant="${variant}"`);
     toast.success(`🎯 "${word}" detected (${confidence}, ${(voteScore*100).toFixed(0)}% votes). Saving 30s pre + 30s post…`);

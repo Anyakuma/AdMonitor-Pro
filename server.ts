@@ -6,6 +6,7 @@ import { Pool } from "pg";
 const DEFAULT_PORT = 3002;
 const MAX_PORT_RETRIES = 20;
 const rawDatabaseUrl = process.env.DATABASE_URL?.trim();
+const deepgramApiKey = process.env.DEEPGRAM_API_KEY?.trim();
 const isProduction = process.env.NODE_ENV === "production";
 
 type RecordingPayload = {
@@ -211,6 +212,65 @@ async function startServer() {
   app.use(express.json({ limit: "50mb" }));
 
   // --- API Routes ---
+
+  // Deepgram temporary token (never expose raw API key to browser clients)
+  app.post("/api/deepgram/token", async (_req, res) => {
+    if (!deepgramApiKey) {
+      return res.status(503).json({ error: "Deepgram is not configured on this server" });
+    }
+
+    try {
+      // 1. Get Project ID
+      const projRes = await fetch("https://api.deepgram.com/v1/projects", {
+        headers: { Authorization: `Token ${deepgramApiKey}` },
+      });
+
+      if (!projRes.ok) {
+        console.error("[server] Deepgram projects request failed:", await projRes.text());
+        return res.status(502).json({ error: "Failed to authenticate with Deepgram" });
+      }
+
+      const projData = await projRes.json();
+      const projectId = projData.projects?.[0]?.project_id;
+
+      if (!projectId) {
+        return res.status(502).json({ error: "No Deepgram project found" });
+      }
+
+      // 2. Create Temporary Key
+      const keyRes = await fetch(`https://api.deepgram.com/v1/projects/${projectId}/keys`, {
+        method: "POST",
+        headers: {
+          Authorization: `Token ${deepgramApiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          comment: "AdMonitor Pro Temp Key",
+          scopes: ["usage:write"],
+          time_to_live_in_seconds: 60,
+        }),
+      });
+
+      if (!keyRes.ok) {
+        console.error("[server] Deepgram key request failed:", await keyRes.text());
+        return res.status(502).json({ error: "Failed to generate Deepgram temporary key" });
+      }
+
+      const payload = (await keyRes.json()) as { key?: string; api_key?: string };
+      const generatedKey = payload.key || payload.api_key;
+      if (!generatedKey) {
+        return res.status(502).json({ error: "Deepgram token response malformed" });
+      }
+
+      return res.json({
+        access_token: generatedKey,
+        expires_in: 60,
+      });
+    } catch (error) {
+      console.error("[server] Deepgram token error:", error);
+      return res.status(502).json({ error: "Deepgram token endpoint unreachable" });
+    }
+  });
 
   // Keywords
   app.get("/api/keywords", async (_req, res) => {

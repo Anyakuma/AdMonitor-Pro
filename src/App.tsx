@@ -68,7 +68,7 @@ import * as recordingService from './features/recordings/services/recordingServi
 // Types (App-specific)
 // ─────────────────────────────────────────────────────────────────────────────
 type DetectorMode = 'browser' | 'hybrid-preferred' | 'hybrid-required';
-type DetectorSource = 'webspeech' | 'vosk';
+type DetectorSource = 'webspeech' | 'vosk' | 'deepgram';
 type StoredRecording = Omit<Recording, 'url' | 'timestamp'> & { timestamp: string };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -504,8 +504,7 @@ const getSupportedMimeType = (): string => {
 const blobToBase64 = (b: Blob): Promise<string> => new Promise((res,rej)=>{const r=new FileReader();r.onloadend=()=>res(r.result as string);r.onerror=rej;r.readAsDataURL(b);});
 const base64ToBlob = async (b64: string): Promise<Blob> => { const r=await fetch(b64);return r.blob(); };
 const DEFAULT_VOSK_MODEL_URL = '/models/vosk-model-small-en-us-0.15.tar.gz';
-// 🔴 BUG FIX: Removed duplicate toStoredRecording and hydrateStoredRecordings functions
-// These are now properly imported from recordingService with async blob serialization
+const DEFAULT_DEEPGRAM_MODEL_URL = '/models/deepgram-general-v1.bin';
 const buildKeywordStats = (items: Recording[]): Record<string, KeywordStat> => {
   const stats: Record<string, KeywordStat> = {};
 
@@ -568,6 +567,11 @@ export default function App() {
   });
   const [voskStatus,        setVoskStatus]         = useState<'disabled'|'loading'|'ready'|'error'>(() => 'disabled');
   const [voskPartial,       setVoskPartial]        = useState('');
+  const [useDeepgram,       setUseDeepgram]        = useState<boolean>(() => {
+    if (typeof window !== 'undefined') return localStorage.getItem('useDeepgram') === 'true';
+    return false;
+  });
+  const [deepgramStatus,    setDeepgramStatus]     = useState<'disabled'|'loading'|'ready'|'error'>('disabled');
   const [showSettings,      setShowSettings]       = useState(true);
   const [showStats,         setShowStats]          = useState(false);
   const [filterEnabled,     setFilterEnabled]      = useState(true);
@@ -742,6 +746,9 @@ export default function App() {
   const voskModelLoadPromiseRef = useRef<Promise<any> | null>(null);
   const webSpeechHitRef    = useRef<SourceDetection | null>(null);
   const voskHitRef         = useRef<SourceDetection | null>(null);
+  const deepgramWsRef      = useRef<WebSocket | null>(null);
+  const deepgramHitRef     = useRef<SourceDetection | null>(null);
+  const deepgramTranscriptWindowRef = useRef<string[]>([]);
   const expandedMapRef     = useRef<Map<string, string[]>>(new Map()); // 🔴 BUG #1
   const homoMapRef         = useRef<Map<string, string[]>>(new Map()); // 🔴 BUG #1
   const voskTranscriptWindowRef = useRef<string[]>([]); // 🔴 BUG #1
@@ -777,6 +784,11 @@ export default function App() {
     localStorage.setItem('voskModelUrl', voskModelUrl.trim());
     setVoskStatus('disabled');
   }, [voskModelUrl]);
+
+  useEffect(() => {
+    localStorage.setItem('useDeepgram', useDeepgram.toString());
+    if (!useDeepgram) setDeepgramStatus('disabled');
+  }, [useDeepgram]);
 
   useEffect(() => {
     return () => {
@@ -916,9 +928,19 @@ export default function App() {
   useEffect(() => {
     const mediaDevices = navigator.mediaDevices;
     if (!mediaDevices?.enumerateDevices) return;
-    mediaDevices.enumerateDevices()
-      .then(d => setMicDevices(d.filter(device => device.kind === 'audioinput')))
-      .catch(() => {});
+
+    const refreshDevices = () => {
+      mediaDevices.enumerateDevices()
+        .then(d => setMicDevices(d.filter(device => device.kind === 'audioinput')))
+        .catch(() => {});
+    };
+
+    refreshDevices();
+    mediaDevices.addEventListener?.('devicechange', refreshDevices);
+
+    return () => {
+      mediaDevices.removeEventListener?.('devicechange', refreshDevices);
+    };
   }, []);
 
   // Backend sync
@@ -954,7 +976,7 @@ export default function App() {
           const data = await rec.json();
           const parsed: Recording[] = await Promise.all(data.map(async (r: any) => {
             const blob = await base64ToBlob(r.audioBase64);
-            return { id:r.id, blob, url:URL.createObjectURL(blob), timestamp:new Date(r.timestamp),
+            return { id:r.id, blob, url:'', timestamp:new Date(r.timestamp),
               triggerWord:r.triggerWord, duration:r.duration, confidence:r.confidence||'Strong',
               transcript:r.transcript||'', voteScore:r.voteScore||0, matchVariant:r.matchVariant };
           }));
@@ -981,6 +1003,10 @@ export default function App() {
     setDebugLog(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 60));
   }, []);
 
+  const throttledSetVoskPartial = useMemo(() => createThrottle(setVoskPartial, 100), []);
+  const throttledSetLiveTranscript = useMemo(() => createThrottle(setLiveTranscript, 100), []);
+  const throttledSpeechLog = useMemo(() => createThrottle(appendDebug, 500), [appendDebug]);
+
   const cleanupVosk = useCallback(() => {
     try { voskRecognizerRef.current?.remove?.(); } catch {}
     try { voskModelRef.current?.terminate?.(); } catch {}
@@ -990,6 +1016,14 @@ export default function App() {
     voskHitRef.current = null;
     setVoskPartial('');
     setVoskStatus('disabled');
+  }, []);
+
+  const cleanupDeepgram = useCallback(() => {
+    try { deepgramWsRef.current?.close(); } catch {}
+    deepgramWsRef.current = null;
+    deepgramHitRef.current = null;
+    deepgramTranscriptWindowRef.current = [];
+    setDeepgramStatus('disabled');
   }, []);
 
   // ── Voice Activity Detection (RMS-based) ────────────────────────────────
@@ -1219,7 +1253,8 @@ export default function App() {
     const current: SourceDetection = { source, result, at: now };
 
     if (source === 'webspeech') webSpeechHitRef.current = current;
-    else voskHitRef.current = current;
+    else if (source === 'vosk') voskHitRef.current = current;
+    else deepgramHitRef.current = current;
 
     const browserHit = webSpeechHitRef.current && now - webSpeechHitRef.current.at <= freshWindowMs
       ? webSpeechHitRef.current
@@ -1227,7 +1262,10 @@ export default function App() {
     const voskHit = voskHitRef.current && now - voskHitRef.current.at <= freshWindowMs
       ? voskHitRef.current
       : null;
-    const hybridAvailable = voskStatus === 'ready';
+    const deepgramHit = deepgramHitRef.current && now - deepgramHitRef.current.at <= freshWindowMs
+      ? deepgramHitRef.current
+      : null;
+    const hybridAvailable = voskStatus === 'ready' || deepgramStatus === 'ready';
     const highConfidenceSolo = result.confidence === 'Strong' && result.voteScore >= 0.72;
 
     if (detectorModeRef.current === 'browser' || !hybridAvailable) {
@@ -1235,29 +1273,32 @@ export default function App() {
       return;
     }
 
-    if (browserHit && voskHit) {
-      if (browserHit.result.keyword !== voskHit.result.keyword) {
-        appendDebug(`Hybrid disagreement: browser="${browserHit.result.keyword}" vs vosk="${voskHit.result.keyword}"`);
+    const secondaryHit = voskHit || deepgramHit;
+
+    if (browserHit && secondaryHit) {
+      if (browserHit.result.keyword !== secondaryHit.result.keyword) {
+        appendDebug(`Hybrid disagreement: browser="${browserHit.result.keyword}" vs secondary="${secondaryHit.result.keyword}"`);
         return;
       }
 
-      const mergedConfidence = strongerConfidence(browserHit.result.confidence, voskHit.result.confidence);
-      const mergedVote = Math.min(1, (browserHit.result.voteScore + voskHit.result.voteScore) / 2 + 0.12);
+      const mergedConfidence = strongerConfidence(browserHit.result.confidence, secondaryHit.result.confidence);
+      const mergedVote = Math.min(1, (browserHit.result.voteScore + secondaryHit.result.voteScore) / 2 + 0.12);
       appendDebug(`Hybrid confirmed "${browserHit.result.keyword}" (${mergedConfidence}, ${(mergedVote*100).toFixed(0)}%)`);
       triggerRecording(
         browserHit.result.keyword,
         mergedConfidence,
-        browserHit.result.transcript || voskHit.result.transcript,
+        browserHit.result.transcript || secondaryHit.result.transcript,
         mergedVote,
-        browserHit.result.variant || voskHit.result.variant
+        browserHit.result.variant || secondaryHit.result.variant
       );
       webSpeechHitRef.current = null;
       voskHitRef.current = null;
+      deepgramHitRef.current = null;
       return;
     }
 
     if (detectorModeRef.current === 'hybrid-required') {
-      appendDebug(`Hybrid waiting for corroboration from ${source === 'webspeech' ? 'Vosk' : 'Web Speech'}`);
+      appendDebug(`Hybrid waiting for corroboration from ${source === 'webspeech' ? 'Secondary' : 'Web Speech'}`);
       return;
     }
 
@@ -1265,7 +1306,7 @@ export default function App() {
       appendDebug(`Hybrid solo trigger accepted from ${source} (${(result.voteScore*100).toFixed(0)}%)`);
       triggerRecording(result.keyword, result.confidence, result.transcript, result.voteScore, result.variant);
     }
-  }, [appendDebug, triggerRecording, voskStatus]);
+  }, [appendDebug, triggerRecording, voskStatus, deepgramStatus]);
 
   const evaluateTranscriptSource = useCallback((
     source: DetectorSource,
@@ -1274,12 +1315,13 @@ export default function App() {
     const cleaned = hypotheses.filter(h => h.transcript.trim());
     if (!cleaned.length || !keywordsRef.current.length) return;
 
-    const result = voteOnHypotheses(
+    const sigMap = keywordSignaturesRef.current || new Map();
+    const sensMap = { 1: 'low', 2: 'low', 3: 'medium', 4: 'medium', 5: 'high' } as const;
+
+    const result = voteOnHypotheses_OPTIMIZED(
       cleaned,
-      keywordsRef.current,
-      expandedMapRef.current,
-      sensitivityRef.current,
-      homoMapRef.current
+      sigMap,
+      sensMap[sensitivityRef.current as 1|2|3|4|5] ?? 'medium'
     );
 
     if (result.matched) {
@@ -1330,7 +1372,7 @@ export default function App() {
       const recognizer = new model.KaldiRecognizer(sampleRate);
       recognizer.setWords(true);
       recognizer.on('partialresult', (message: any) => {
-        setVoskPartial(message?.result?.partial?.trim() || '');
+        throttledSetVoskPartial(message?.result?.partial?.trim() || '');
       });
       recognizer.on('result', (message: any) => {
         const text = message?.result?.text?.trim() || '';
@@ -1359,6 +1401,79 @@ export default function App() {
       // Vosk is an optional enhancement, not required for operation
     }
   }, [appendDebug, evaluateTranscriptSource, preloadVoskModel, voskModelUrl]);
+
+  const initDeepgramRecognizer = useCallback(async (sampleRate: number) => {
+    if (!useDeepgram) {
+      setDeepgramStatus('disabled');
+      return;
+    }
+    if (deepgramWsRef.current) return;
+
+    try {
+      setDeepgramStatus('loading');
+      const response = await fetch('/api/deepgram/token', { method: 'POST' });
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || 'Failed to get Deepgram token (is DEEPGRAM_API_KEY set?)');
+      }
+      const payload = await response.json();
+      if (!payload.access_token) throw new Error('Invalid token response');
+
+      const wsUrl = `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=${sampleRate}&channels=1&interim_results=true&model=nova-2`;
+      const ws = new WebSocket(wsUrl, ['token', payload.access_token]);
+
+      ws.onopen = () => {
+        setDeepgramStatus('ready');
+        appendDebug('Deepgram WebSocket connected');
+      };
+
+      ws.onmessage = (event) => {
+        if (isPausedRef.current) return;
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'Results' || data.channel) {
+            const transcript = data.channel?.alternatives?.[0]?.transcript?.trim();
+            const confidence = data.channel?.alternatives?.[0]?.confidence || 0.5;
+            const isFinal = data.is_final;
+            if (transcript) {
+              if (isFinal) {
+                deepgramTranscriptWindowRef.current.push(transcript);
+                if (deepgramTranscriptWindowRef.current.length > 4) deepgramTranscriptWindowRef.current.shift();
+              }
+              const windowContext = deepgramTranscriptWindowRef.current.join(' ') + (isFinal ? '' : ' ' + transcript);
+              evaluateTranscriptSource('deepgram', [
+                { transcript: transcript, confidence: confidence },
+                { transcript: windowContext.trim(), confidence: Math.max(0.6, confidence - 0.1) }
+              ]);
+            }
+          } else if (data.type === 'Error') {
+            appendDebug(`Deepgram error: ${data.message || data.err_msg}`);
+            setDeepgramStatus('error');
+          }
+        } catch (e) {}
+      };
+
+      ws.onerror = () => {
+        appendDebug('Deepgram WebSocket error');
+        setDeepgramStatus('error');
+      };
+
+      ws.onclose = () => {
+        appendDebug('Deepgram WebSocket closed');
+        deepgramWsRef.current = null;
+        if (isListeningRef.current) {
+          setDeepgramStatus('error');
+        } else {
+          setDeepgramStatus('disabled');
+        }
+      };
+
+      deepgramWsRef.current = ws;
+    } catch (err: any) {
+      appendDebug(`Deepgram init failed: ${err.message}`);
+      setDeepgramStatus('error');
+    }
+  }, [appendDebug, evaluateTranscriptSource, useDeepgram]);
 
   useEffect(() => {
     if (detectorMode === 'browser') return;
@@ -1400,6 +1515,60 @@ export default function App() {
   }, []);
 
   // ── Main toggle ───────────────────────────────────────────────────────────
+  const requestMicrophoneStream = useCallback(async (): Promise<MediaStream> => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('Microphone API not supported in this browser (or insecure context).');
+    }
+
+    const preferredSampleRate = isMobile ? 16000 : 48000;
+    const fallbackSampleRate = isMobile ? 16000 : 32000;
+    const withSelectedMic = selectedMic ? { deviceId: { exact: selectedMic } } : {};
+
+    const candidates: MediaStreamConstraints[] = [
+      {
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: { ideal: preferredSampleRate, min: fallbackSampleRate },
+          ...withSelectedMic,
+        }
+      },
+      {
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          ...withSelectedMic,
+        }
+      },
+      {
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }
+      },
+      { audio: true },
+    ];
+
+    let lastError: any = null;
+    for (const constraints of candidates) {
+      try {
+        return await navigator.mediaDevices.getUserMedia(constraints);
+      } catch (error: any) {
+        lastError = error;
+        if (error.name === 'NotAllowedError') {
+          throw error; // Don't retry if user explicitly denied
+        }
+      }
+    }
+
+    throw lastError ?? new Error('Microphone request failed');
+  }, [isMobile, selectedMic]);
+
   const toggleListening = useCallback(() => {
     if (isListeningRef.current) {
       recognitionRef.current?.stop();
@@ -1407,6 +1576,7 @@ export default function App() {
       processorRef.current?.disconnect();
       streamRef.current?.getTracks().forEach(t => t.stop());
       cleanupVosk();
+      cleanupDeepgram();
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
       visualization.stopVisualization();
       visualization.resetCalibration();
@@ -1424,28 +1594,19 @@ export default function App() {
       }
 
       // ── Mobile optimization: Adjust sample rate based on device ────
-      const preferredSampleRate = isMobile ? 16000 : 48000;
-      const fallbackSampleRate = isMobile ? 16000 : 32000;
-      
-      const constraints: MediaStreamConstraints = {
-        audio: {
-          echoCancellation: true,   // helps with clarity across devices
-          noiseSuppression: true,   // improves signal-to-noise ratio
-          autoGainControl: true,    // stabilizes volume across different mic types
-          channelCount: 1,
-          sampleRate: { ideal: preferredSampleRate, min: fallbackSampleRate },  // lower rates on mobile for CPU efficiency
-          ...(selectedMic ? { deviceId: { exact: selectedMic } } : {})
-        }
-      };
-
-      navigator.mediaDevices.getUserMedia(constraints).then(stream => {
+      requestMicrophoneStream().then(stream => {
         streamRef.current = stream;
+        navigator.mediaDevices?.enumerateDevices?.()
+          .then(d => setMicDevices(d.filter(device => device.kind === 'audioinput')))
+          .catch(() => {});
         startVisualiser(stream);
 
         const ctx = audioCtxRef.current!;
         const bufSize = ctx.sampleRate * 90; // 90 s: 30 s pre + 30 s post + 30 s headroom
         circBufRef.current = new Float32Array(bufSize);
         writeHeadRef.current = 0;
+
+        let pcm16Buffer = new Int16Array(2048); // Pre-allocate buffer to prevent GC pauses
 
         // PCM circular buffer writer — uses filtered source if available
         const rawSrc = ctx.createMediaStreamSource(stream);
@@ -1462,6 +1623,7 @@ export default function App() {
             rawSrc.connect(proc);
           }
           proc.connect(sink); sink.connect(ctx.destination);
+
 
           // ⚡ PHASE 2.4: Optimize audio buffer copying - avoid allocations
           proc.onaudioprocess = (e) => {
@@ -1494,6 +1656,22 @@ export default function App() {
                 console.warn('Vosk waveform accept failed', error);
               }
             }
+        
+        // For Deepgram: Convert to Linear16 PCM
+        if (deepgramWsRef.current && deepgramWsRef.current.readyState === WebSocket.OPEN) {
+          try {
+            if (inp.length !== pcm16Buffer.length) {
+              pcm16Buffer = new Int16Array(inp.length);
+            }
+            for (let i = 0; i < inp.length; i++) {
+              const s = Math.max(-1, Math.min(1, inp[i]));
+              pcm16Buffer[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            deepgramWsRef.current.send(pcm16Buffer.buffer);
+          } catch (error) {
+            console.warn('Deepgram waveform send failed', error);
+          }
+        }
           };
           processorRef.current = proc;
         } catch(e) { console.warn('ScriptProcessor unavailable', e); }
@@ -1601,10 +1779,10 @@ export default function App() {
             const windowJoined = transcriptQueueRef.current.join(' ');
             hyps.push({ transcript: windowJoined, confidence: 0.7 });
 
-            setLiveTranscript(boundedTranscript.slice(-150));
+            throttledSetLiveTranscript(boundedTranscript.slice(-150));
             // 🔴 CRITICAL FIX: Null-check keywordSignaturesRef before accessing .size
             const sigMap = keywordSignaturesRef.current || new Map();
-            appendDebug(`Speech: "${boundedTranscript.slice(0,80)}" (${hyps.length} hypotheses, ${sigMap.size} keywords)`);
+            throttledSpeechLog(`Speech: "${boundedTranscript.slice(0,80)}" (${hyps.length} hypotheses, ${sigMap.size} keywords)`);
 
             // ⚡ OPTIMIZATION 4: Use optimized voting with cached signatures (5x faster)
             const sensMap = {
@@ -1639,6 +1817,9 @@ export default function App() {
           initVoskRecognizer(ctx.sampleRate).catch(err => {
             appendDebug(`Vosk initialization failed: ${err?.message || 'unknown error'}`);
           });
+          initDeepgramRecognizer(ctx.sampleRate).catch(err => {
+            appendDebug(`Deepgram initialization failed: ${err?.message || 'unknown error'}`);
+          });
         }
 
         setIsListening(true); isListeningRef.current = true;
@@ -1658,6 +1839,9 @@ export default function App() {
         }
         else if (err.name==='NotFoundError') {
           msg = 'No microphone found. Please connect a microphone and try again.';
+        }
+        else if (err.name==='OverconstrainedError') {
+          msg = 'Requested microphone settings are not supported on this device.';
         }
         else if (err.name==='NotReadableError') {
           msg = 'Microphone is being used by another app. Close the other app and try again.';
@@ -1682,7 +1866,7 @@ export default function App() {
         }
       });
     }
-  }, [selectedMic, startVisualiser, saveRecording, triggerRecording, refreshGrammar, appendDebug, cleanupVosk, evaluateTranscriptSource, initVoskRecognizer]);
+  }, [requestMicrophoneStream, startVisualiser, saveRecording, triggerRecording, refreshGrammar, appendDebug, cleanupVosk, cleanupDeepgram, evaluateTranscriptSource, initVoskRecognizer, initDeepgramRecognizer]);
 
   // ── Keyword management ────────────────────────────────────────────────────
   const addKeyword = async (e: React.FormEvent) => {
@@ -2232,6 +2416,20 @@ export default function App() {
                       )}
                     </div>
 
+                <div>
+                  <label className="block text-xs font-medium text-zinc-400 mb-2">Cloud ASR (Deepgram)</label>
+                  <label className="flex items-center gap-2 text-sm text-zinc-300 cursor-pointer p-3 bg-zinc-800 rounded-xl border border-zinc-700 hover:border-zinc-600 transition-colors">
+                    <input type="checkbox" checked={useDeepgram} onChange={e=>setUseDeepgram(e.target.checked)} className="rounded accent-blue-500 w-4 h-4" />
+                    Enable Deepgram Integration
+                  </label>
+                  <div className="mt-2 flex items-center justify-between text-[10px] mono">
+                    <span className="text-zinc-600">Status</span>
+                    <span className={deepgramStatus === 'ready' ? 'text-emerald-500' : deepgramStatus === 'loading' ? 'text-amber-400' : deepgramStatus === 'error' ? 'text-red-400' : 'text-zinc-600'}>
+                      {deepgramStatus}
+                    </span>
+                  </div>
+                </div>
+
                     {/* Fixed 30+30 recording window info */}
                     <div className="bg-blue-500/5 border border-blue-500/15 rounded-xl p-3 flex items-center justify-between">
                       <div>
@@ -2295,6 +2493,7 @@ export default function App() {
                         ['VAD gate', 'Adaptive RMS threshold', true],
                         ['Detector mode', detectorMode, true],
                         ['Secondary ASR', voskModelUrl ? `Vosk ${voskStatus}` : 'Not configured', voskStatus === 'ready' || !voskModelUrl],
+                    ['Deepgram ASR', useDeepgram ? deepgramStatus : 'Disabled', deepgramStatus === 'ready' || !useDeepgram],
                         ['Phoneme expansion', keywords.length ? `${[...(expandedMapRef.current?.values?.() || [])].reduce((s,a)=>s+(a?.length||0),0)} variants` : 'Add keywords', true],
                         ['Multi-hypothesis', '8 alternatives + vote', true],
                         ['Soundex + Metaphone', 'Dual phonetic matching', true],
@@ -2514,4 +2713,3 @@ function MicOff({ size=24, className='' }: { size?:number; className?:string }) 
     </svg>
   );
 }
-

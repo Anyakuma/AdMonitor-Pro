@@ -160,17 +160,17 @@ export function useRecordingManager(options: UseRecordingManagerOptions = {}) {
   const deleteRecording = useCallback(
     async (recordingId: string) => {
       try {
-        // Revoke URL
-        const rec = recordings.find((r) => r.id === recordingId);
-        if (rec) {
-          URL.revokeObjectURL(rec.url);
-        }
-
-        // Delete from all sources
+        // Delete from DB FIRST to avoid breaking UI on failure
         await Promise.all([
           recordingService.deleteRecordingFromDatabase(recordingId),
           recordingService.removeRecordingFromSyncQueue(recordingId),
         ]);
+
+        // Revoke URL only after DB operations succeed
+        const rec = recordings.find((r) => r.id === recordingId);
+        if (rec) {
+          URL.revokeObjectURL(rec.url);
+        }
 
         // Server delete is best-effort
         recordingService.deleteRecordingFromServer(recordingId).catch(() => {});
@@ -192,13 +192,13 @@ export function useRecordingManager(options: UseRecordingManagerOptions = {}) {
       try {
         setIsLoading(true);
 
-        // Revoke URLs
+        // Delete from database FIRST to avoid breaking UI on failure
+        await recordingService.deleteRecordingsBulk(recordingIds);
+
+        // Revoke URLs only after DB operations succeed
         recordings
           .filter((r) => recordingIds.includes(r.id))
           .forEach((r) => URL.revokeObjectURL(r.url));
-
-        // Delete from database
-        await recordingService.deleteRecordingsBulk(recordingIds);
 
         // Remove from state
         setRecordings((prev) =>

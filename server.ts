@@ -1,7 +1,6 @@
 import "dotenv/config";
 import dns from "node:dns";
 import express from "express";
-import { createServer as createViteServer } from "vite";
 import { Pool } from "pg";
 
 // Force Node.js to use IPv4 first. This fixes ENOTFOUND and ConnectTimeout errors

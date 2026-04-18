@@ -6,7 +6,9 @@ import { Pool } from "pg";
 
 // Force Node.js to use IPv4 first. This fixes ENOTFOUND and ConnectTimeout errors
 // on local networks that lack proper IPv6 routing.
-dns.setDefaultResultOrder("ipv4first");
+if (!process.env.VERCEL) {
+  dns.setDefaultResultOrder("ipv4first");
+}
 
 const DEFAULT_PORT = 3002;
 const MAX_PORT_RETRIES = 20;

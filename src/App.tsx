@@ -504,6 +504,7 @@ const getSupportedMimeType = (): string => {
 const blobToBase64 = (b: Blob): Promise<string> => new Promise((res,rej)=>{const r=new FileReader();r.onloadend=()=>res(r.result as string);r.onerror=rej;r.readAsDataURL(b);});
 const base64ToBlob = async (b64: string): Promise<Blob> => { const r=await fetch(b64);return r.blob(); };
 const DEFAULT_VOSK_MODEL_URL = '/models/vosk-model-small-en-us-0.15.tar.gz';
+const API_BASE = (import.meta as any).env?.VITE_API_URL || '';
 const DEFAULT_DEEPGRAM_MODEL_URL = '/models/deepgram-general-v1.bin';
 const buildKeywordStats = (items: Recording[]): Record<string, KeywordStat> => {
   const stats: Record<string, KeywordStat> = {};
@@ -962,7 +963,7 @@ export default function App() {
       } catch {}
 
       try {
-        const [kw,rec] = await Promise.all([fetch('/api/keywords'),fetch('/api/recordings')]);
+        const [kw,rec] = await Promise.all([fetch(`${API_BASE}/api/keywords`),fetch(`${API_BASE}/api/recordings`)]);
         if (kw.ok) {
           const nextKeywords = await kw.json();
           const kwList = nextKeywords.map((k: any) => typeof k === 'object' ? k.word : k);
@@ -1412,7 +1413,7 @@ export default function App() {
 
     try {
       setDeepgramStatus('loading');
-      const response = await fetch('/api/deepgram/token', { method: 'POST' });
+      const response = await fetch(`${API_BASE}/api/deepgram/token`, { method: 'POST' });
       if (!response.ok) {
         const errData = await response.json().catch(() => ({}));
         throw new Error(errData.error || 'Failed to get Deepgram token (is DEEPGRAM_API_KEY set?)');
@@ -1884,7 +1885,7 @@ export default function App() {
     const homos = getHomophones(word);
     appendDebug(`Added "${word}" → ${variants.length} phonetic variants, ${homos.length} homophones`);
     toast.success(`"${word}" added — ${variants.length} variants generated`);
-    try { await fetch('/api/keywords',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({word})}); } catch {}
+    try { await fetch(`${API_BASE}/api/keywords`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({word})}); } catch {}
   };
 
   const removeKeyword = async (word: string) => {
@@ -1894,7 +1895,7 @@ export default function App() {
       await db.cacheKeywords(nextKeywords.map((value, index) => ({ id: index + 1, word: value })));
     } catch {}
     toast.info(`"${word}" removed`);
-    try { await fetch(`/api/keywords/${encodeURIComponent(word)}`,{method:'DELETE'}); } catch {}
+    try { await fetch(`${API_BASE}/api/keywords/${encodeURIComponent(word)}`,{method:'DELETE'}); } catch {}
   };
 
   // ── Recording management ──────────────────────────────────────────────────

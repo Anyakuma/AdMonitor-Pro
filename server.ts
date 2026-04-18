@@ -1,7 +1,12 @@
 import "dotenv/config";
+import dns from "node:dns";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import { Pool } from "pg";
+
+// Force Node.js to use IPv4 first. This fixes ENOTFOUND and ConnectTimeout errors
+// on local networks that lack proper IPv6 routing.
+dns.setDefaultResultOrder("ipv4first");
 
 const DEFAULT_PORT = 3002;
 const MAX_PORT_RETRIES = 20;
@@ -204,13 +209,10 @@ function listenWithPortRetry(app: express.Express, host: string, startPort: numb
   });
 }
 
-async function startServer() {
-  const app = express();
-  const startPort = parseStartPort();
+const app = express();
+app.use(express.json({ limit: "50mb" }));
 
-  // Increase payload limit for audio base64 uploads
-  app.use(express.json({ limit: "50mb" }));
-
+function setupRoutes() {
   // --- API Routes ---
 
   // Deepgram temporary token (never expose raw API key to browser clients)
@@ -312,11 +314,8 @@ async function startServer() {
     }
 
     try {
-      const id = Number.parseInt(req.params.id, 10);
-      if (Number.isNaN(id)) {
-        return res.status(400).json({ error: "Invalid keyword ID" });
-      }
-      await pool!.query("DELETE FROM keywords WHERE id = $1", [id]);
+      const word = req.params.id;
+      await pool!.query("DELETE FROM keywords WHERE word = $1", [word]);
       return res.json({ success: true });
     } catch (err) {
       console.error("DELETE /api/keywords error:", err);
@@ -378,9 +377,17 @@ async function startServer() {
     }
   });
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
+}
+
+setupRoutes();
+export default app;
+
+async function startServer() {
+  const startPort = parseStartPort();
+
+  if (process.env.NODE_ENV !== "production" && !process.env.VERCEL) {
     const hmrPort = Number.parseInt(process.env.HMR_PORT ?? "0", 10) || 0;
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -389,26 +396,32 @@ async function startServer() {
       appType: "spa",
     });
     app.use(vite.middlewares);
-  } else {
+  } else if (!process.env.VERCEL) {
     app.use(express.static("dist"));
   }
 
-  const boundPort = await listenWithPortRetry(app, "0.0.0.0", startPort);
-  console.log(`[server] Running on http://localhost:${boundPort}`);
+  if (!process.env.VERCEL) {
+    const boundPort = await listenWithPortRetry(app, "0.0.0.0", startPort);
+    console.log(`[server] Running on http://localhost:${boundPort}`);
 
-  process.on("SIGTERM", async () => {
-    try {
-      await pool?.end();
-    } finally {
-      process.exit(0);
-    }
-  });
+    process.on("SIGTERM", async () => {
+      try {
+        await pool?.end();
+      } finally {
+        process.exit(0);
+      }
+    });
+  }
 }
 
-// Initialize database and start server
-initializeDatabase()
-  .then(() => startServer())
-  .catch((error) => {
-    console.error("[server] Failed to start server:", error);
-    process.exit(1);
-  });
+if (!process.env.VERCEL) {
+  initializeDatabase()
+    .then(() => startServer())
+    .catch((error) => {
+      console.error("[server] Failed to start server:", error);
+      process.exit(1);
+    });
+} else {
+  // On Vercel, simply trigger the database init asynchronously
+  initializeDatabase().catch(console.error);
+}

@@ -965,12 +965,13 @@ export default function App() {
         const [kw,rec] = await Promise.all([fetch('/api/keywords'),fetch('/api/recordings')]);
         if (kw.ok) {
           const nextKeywords = await kw.json();
+          const kwList = nextKeywords.map((k: any) => typeof k === 'object' ? k.word : k);
           if (!cancelled) {
-            setKeywords(nextKeywords);
+            setKeywords(kwList);
             // ⚡ PHASE 2: Warm Levenshtein cache for server keywords
-            preWarmLevenshteinCache(nextKeywords);
+            preWarmLevenshteinCache(kwList);
           }
-          await db.cacheKeywords(nextKeywords.map((word: string, index: number) => ({ id: index + 1, word })));
+          await db.cacheKeywords(kwList.map((word: string, index: number) => ({ id: index + 1, word })));
         }
         if (rec.ok) {
           const data = await rec.json();

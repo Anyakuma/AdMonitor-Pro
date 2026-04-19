@@ -6,7 +6,7 @@ import {defineConfig, loadEnv} from 'vite';
 export default defineConfig(({mode}) => {
   const env = loadEnv(mode, '.', '');
   return {
-    base: process.env.ELECTRON === 'true' ? './' : '/',
+    base: (process.env.ELECTRON === 'true' || process.env.CAPACITOR === 'true') ? './' : '/',
     plugins: [tailwindcss(), react()],
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),

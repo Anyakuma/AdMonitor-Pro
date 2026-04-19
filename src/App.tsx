@@ -1422,7 +1422,7 @@ export default function App() {
       if (!payload.access_token) throw new Error('Invalid token response');
 
       const wsUrl = `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=${sampleRate}&channels=1&interim_results=true&model=nova-2`;
-      const ws = new WebSocket(wsUrl, ['token', payload.access_token]);
+      const ws = new WebSocket(wsUrl, ['token', payload.access_token.trim()]);
 
       ws.onopen = () => {
         setDeepgramStatus('ready');
@@ -1455,8 +1455,9 @@ export default function App() {
         } catch (e) {}
       };
 
-      ws.onerror = () => {
-        appendDebug('Deepgram WebSocket error');
+      ws.onerror = (event: Event) => {
+        appendDebug('Deepgram WebSocket error (check console)');
+        console.error('Deepgram WebSocket error:', event);
         setDeepgramStatus('error');
       };
 
@@ -1608,8 +1609,6 @@ export default function App() {
         circBufRef.current = new Float32Array(bufSize);
         writeHeadRef.current = 0;
 
-        let pcm16Buffer = new Int16Array(2048); // Pre-allocate buffer to prevent GC pauses
-
         // PCM circular buffer writer — uses filtered source if available
         const rawSrc = ctx.createMediaStreamSource(stream);
         try {
@@ -1662,14 +1661,12 @@ export default function App() {
         // For Deepgram: Convert to Linear16 PCM
         if (deepgramWsRef.current && deepgramWsRef.current.readyState === WebSocket.OPEN) {
           try {
-            if (inp.length !== pcm16Buffer.length) {
-              pcm16Buffer = new Int16Array(inp.length);
-            }
+            const pcmCopy = new Int16Array(inp.length);
             for (let i = 0; i < inp.length; i++) {
               const s = Math.max(-1, Math.min(1, inp[i]));
-              pcm16Buffer[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+              pcmCopy[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
             }
-            deepgramWsRef.current.send(pcm16Buffer.buffer);
+            deepgramWsRef.current.send(pcmCopy.buffer);
           } catch (error) {
             console.warn('Deepgram waveform send failed', error);
           }
@@ -2421,7 +2418,7 @@ export default function App() {
                 <div>
                   <label className="block text-xs font-medium text-zinc-400 mb-2">Cloud ASR (Deepgram)</label>
                   <label className="flex items-center gap-2 text-sm text-zinc-300 cursor-pointer p-3 bg-zinc-800 rounded-xl border border-zinc-700 hover:border-zinc-600 transition-colors">
-                    <input type="checkbox" checked={useDeepgram} onChange={e=>setUseDeepgram(e.target.checked)} className="rounded accent-blue-500 w-4 h-4 shrink-0" />
+                    <input type="checkbox" checked={useDeepgram} onChange={e=>setUseDeepgram(e.target.checked)} className="rounded accent-blue-500 w-4 h-4 min-w-[16px] min-h-[16px] shrink-0" />
                     <span className="flex-1">Enable Deepgram Integration</span>
                   </label>
                   <div className="mt-2 flex items-center justify-between text-[10px] mono">

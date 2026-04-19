@@ -264,7 +264,7 @@ function setupRoutes() {
         body: JSON.stringify({
           comment: "AdMonitor Pro Temp Key",
           scopes: ["usage:write"],
-          time_to_live_in_seconds: 60,
+          time_to_live_in_seconds: 86400,
         }),
       });
 

@@ -281,7 +281,7 @@ function setupRoutes() {
 
       return res.json({
         access_token: generatedKey,
-        expires_in: 60,
+        expires_in: 86400,
       });
     } catch (error) {
       console.error("[server] Deepgram token fetch error. Using fallback token:", error);

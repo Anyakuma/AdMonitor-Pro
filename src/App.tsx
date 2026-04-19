@@ -504,7 +504,7 @@ const getSupportedMimeType = (): string => {
 const blobToBase64 = (b: Blob): Promise<string> => new Promise((res,rej)=>{const r=new FileReader();r.onloadend=()=>res(r.result as string);r.onerror=rej;r.readAsDataURL(b);});
 const base64ToBlob = async (b64: string): Promise<Blob> => { const r=await fetch(b64);return r.blob(); };
 const DEFAULT_VOSK_MODEL_URL = '/models/vosk-model-small-en-us-0.15.tar.gz';
-const API_BASE = (import.meta as any).env?.VITE_API_URL || '';
+const API_BASE = ((import.meta as any).env?.VITE_API_URL || '').replace(/\/$/, '');
 const DEFAULT_DEEPGRAM_MODEL_URL = '/models/deepgram-general-v1.bin';
 const buildKeywordStats = (items: Recording[]): Record<string, KeywordStat> => {
   const stats: Record<string, KeywordStat> = {};
@@ -2421,8 +2421,8 @@ export default function App() {
                 <div>
                   <label className="block text-xs font-medium text-zinc-400 mb-2">Cloud ASR (Deepgram)</label>
                   <label className="flex items-center gap-2 text-sm text-zinc-300 cursor-pointer p-3 bg-zinc-800 rounded-xl border border-zinc-700 hover:border-zinc-600 transition-colors">
-                    <input type="checkbox" checked={useDeepgram} onChange={e=>setUseDeepgram(e.target.checked)} className="rounded accent-blue-500 w-4 h-4" />
-                    Enable Deepgram Integration
+                    <input type="checkbox" checked={useDeepgram} onChange={e=>setUseDeepgram(e.target.checked)} className="rounded accent-blue-500 w-4 h-4 shrink-0" />
+                    <span className="flex-1">Enable Deepgram Integration</span>
                   </label>
                   <div className="mt-2 flex items-center justify-between text-[10px] mono">
                     <span className="text-zinc-600">Status</span>

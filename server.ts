@@ -214,6 +214,18 @@ function listenWithPortRetry(app: express.Express, host: string, startPort: numb
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
+// Enable CORS for Desktop/Mobile wrapper API access
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  next();
+});
+
 function setupRoutes() {
   // --- API Routes ---
 

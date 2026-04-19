@@ -2418,7 +2418,7 @@ export default function App() {
                 <div>
                   <label className="block text-xs font-medium text-zinc-400 mb-2">Cloud ASR (Deepgram)</label>
                   <label className="flex items-center gap-2 text-sm text-zinc-300 cursor-pointer p-3 bg-zinc-800 rounded-xl border border-zinc-700 hover:border-zinc-600 transition-colors">
-                    <input type="checkbox" checked={useDeepgram} onChange={e=>setUseDeepgram(e.target.checked)} className="rounded accent-blue-500 w-4 h-4 min-w-[16px] min-h-[16px] shrink-0" />
+                    <input type="checkbox" checked={useDeepgram} onChange={e=>setUseDeepgram(e.target.checked)} className="rounded accent-blue-500 w-5 h-5 min-w-[20px] min-h-[20px] shrink-0 cursor-pointer" />
                     <span className="flex-1">Enable Deepgram Integration</span>
                   </label>
                   <div className="mt-2 flex items-center justify-between text-[10px] mono">

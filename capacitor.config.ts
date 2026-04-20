@@ -4,7 +4,7 @@ const config: CapacitorConfig = {
   appId: 'com.admonitor.pro',
   appName: 'AdMonitor Pro',
   webDir: 'dist',
-  bundledWebRuntime: false,
+  // windowsAndroidStudioPath: 'C:\\Program Files\\Android\\Android Studio\\bin\\studio64.exe',
   plugins: {
     CapacitorHttp: {
       enabled: true,

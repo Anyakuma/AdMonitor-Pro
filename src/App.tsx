@@ -1413,16 +1413,31 @@ export default function App() {
 
     try {
       setDeepgramStatus('loading');
-      const response = await fetch(`${API_BASE}/api/deepgram/token`, { method: 'POST' });
-      if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
-        throw new Error(errData.error || 'Failed to get Deepgram token (is DEEPGRAM_API_KEY set?)');
+      let token: string | undefined;
+
+      try {
+        token = process.env.DEEPGRAM_API_KEY;
+      } catch {
+        // Ignore ReferenceError if process is not defined in the browser
       }
-      const payload = await response.json();
-      if (!payload.access_token) throw new Error('Invalid token response');
+
+      if (!token) {
+        token = (import.meta as any).env?.VITE_DEEPGRAM_API_KEY;
+      }
+
+      if (!token) {
+        const response = await fetch(`${API_BASE}/api/deepgram/token`, { method: 'POST' });
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          throw new Error(errData.error || 'Failed to get Deepgram token (is DEEPGRAM_API_KEY set?)');
+        }
+        const payload = await response.json();
+        if (!payload.access_token) throw new Error('Invalid token response');
+        token = payload.access_token;
+      }
 
       const wsUrl = `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=${sampleRate}&channels=1&interim_results=true&model=nova-2`;
-      const ws = new WebSocket(wsUrl, ['token', payload.access_token.trim()]);
+      const ws = new WebSocket(wsUrl, ['token', token.trim()]);
 
       ws.onopen = () => {
         setDeepgramStatus('ready');

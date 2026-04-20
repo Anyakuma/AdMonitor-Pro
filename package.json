@@ -10,7 +10,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit",
+    "lint": "tsc -b",
     "electron:dev": "cross-env NODE_ENV=development electron .",
     "electron:build": "cross-env ELECTRON=true vite build && electron-builder",
     "cap:init": "cap init \"AdMonitor Pro\" com.admonitor.pro --web-dir dist",

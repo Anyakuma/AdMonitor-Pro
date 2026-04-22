@@ -69,10 +69,10 @@ import { BatteryOptimization } from '@capawesome-team/capacitor-android-battery-
 
 const requestBatteryOptimization = async () => {
   if (Capacitor.getPlatform() === 'android') {
-    const { isIgnoringBatteryOptimizations } = await BatteryOptimization.isIgnoringBatteryOptimizations();
-    if (!isIgnoringBatteryOptimizations) {
+    const { enabled } = await BatteryOptimization.isBatteryOptimizationEnabled();
+    if (enabled) {
       // This pops up the native Android dialog asking the user to "Allow" the app to run in the background without restrictions.
-      await BatteryOptimization.requestIgnoreBatteryOptimizations();
+      await BatteryOptimization.requestIgnoreBatteryOptimization();
     }
   }
 };
@@ -637,6 +637,7 @@ export default function App() {
   const filterEnabledRef   = useRef(filterEnabled);
   const noiseFloorRef      = useRef(0);
   const detectorModeRef    = useRef(detectorMode);
+  const useDeepgramRef     = useRef(useDeepgram);
 
   // ⚡ OPTIMIZATION 8: Memory management refs
   const urlPoolRef    = useRef(new URLPool());
@@ -652,7 +653,8 @@ export default function App() {
     isRecordingRef.current = isRecording;
     filterEnabledRef.current = filterEnabled;
     detectorModeRef.current = detectorMode;
-  }, [keywords, sensitivity, isPaused, isRecording, filterEnabled, detectorMode]);
+    useDeepgramRef.current = useDeepgram;
+  }, [keywords, sensitivity, isPaused, isRecording, filterEnabled, detectorMode, useDeepgram]);
 
   // ⚡ OPTIMIZATION 4: Cache keyword signatures (rebuilt whenever keywords change)
   const [keywordSignatures, setKeywordSignatures] = useState<Map<string, PhoneticSignature>>(new Map());
@@ -762,6 +764,7 @@ export default function App() {
   const webSpeechHitRef    = useRef<SourceDetection | null>(null);
   const voskHitRef         = useRef<SourceDetection | null>(null);
   const deepgramWsRef      = useRef<WebSocket | null>(null);
+  const deepgramIntentionalCloseRef = useRef(false);
   const deepgramHitRef     = useRef<SourceDetection | null>(null);
   const deepgramTranscriptWindowRef = useRef<string[]>([]);
   const expandedMapRef     = useRef<Map<string, string[]>>(new Map()); // 🔴 BUG #1
@@ -802,7 +805,6 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem('useDeepgram', useDeepgram.toString());
-    if (!useDeepgram) setDeepgramStatus('disabled');
   }, [useDeepgram]);
 
   useEffect(() => {
@@ -1036,12 +1038,43 @@ export default function App() {
   }, []);
 
   const cleanupDeepgram = useCallback(() => {
+    deepgramIntentionalCloseRef.current = true;
     try { deepgramWsRef.current?.close(); } catch {}
     deepgramWsRef.current = null;
     deepgramHitRef.current = null;
     deepgramTranscriptWindowRef.current = [];
     setDeepgramStatus('disabled');
   }, []);
+
+  const startForegroundServiceWithFallback = useCallback(async () => {
+    const baseOptions = {
+      title: 'AdMonitor Pro',
+      body: 'Monitoring radio streams in the background',
+      id: 1937,
+    };
+    const iconCandidates = ['ic_launcher_foreground', 'splash'];
+    let lastError: unknown = null;
+
+    for (const smallIcon of iconCandidates) {
+      try {
+        await ForegroundService.startForegroundService({
+          ...baseOptions,
+          smallIcon,
+        });
+        if (smallIcon !== iconCandidates[0]) {
+          appendDebug(`Foreground service started with fallback icon "${smallIcon}"`);
+        }
+        return;
+      } catch (error) {
+        lastError = error;
+        const message = (error as any)?.message || 'unknown error';
+        appendDebug(`Foreground icon "${smallIcon}" failed: ${message}`);
+      }
+    }
+
+    console.warn('Foreground service failed to start with all icon candidates', lastError);
+    toast.warning('Background notification icon unavailable on this build.');
+  }, [appendDebug]);
 
   // ── Voice Activity Detection (RMS-based) ────────────────────────────────
   const rmsRef = useRef(0);
@@ -1472,6 +1505,7 @@ export default function App() {
       const ws = new WebSocket(wsUrl, ['token', token.trim()]);
 
       ws.onopen = () => {
+        deepgramIntentionalCloseRef.current = false;
         setDeepgramStatus('ready');
         appendDebug('Deepgram WebSocket connected');
       };
@@ -1509,9 +1543,13 @@ export default function App() {
       };
 
       ws.onclose = () => {
+        const intentional = deepgramIntentionalCloseRef.current || !useDeepgramRef.current;
+        deepgramIntentionalCloseRef.current = false;
         appendDebug('Deepgram WebSocket closed');
         deepgramWsRef.current = null;
-        if (isListeningRef.current) {
+        if (intentional) {
+          setDeepgramStatus('disabled');
+        } else if (isListeningRef.current) {
           setDeepgramStatus('error');
         } else {
           setDeepgramStatus('disabled');
@@ -1526,13 +1564,20 @@ export default function App() {
   }, [appendDebug, evaluateTranscriptSource, useDeepgram]);
 
   useEffect(() => {
-    if (detectorMode === 'browser') return;
-    if (!voskModelUrl.trim()) return;
+    if (!useDeepgram) {
+      cleanupDeepgram();
+      return;
+    }
 
-    preloadVoskModel().catch(() => {
-      // Best-effort warm preload only.
-    });
-  }, [detectorMode, preloadVoskModel, voskModelUrl]);
+    if (isListening) {
+      const sampleRate = audioCtxRef.current?.sampleRate;
+      if (sampleRate) {
+        initDeepgramRecognizer(sampleRate).catch((err: any) => {
+          appendDebug(`Deepgram initialization failed: ${err?.message || 'unknown error'}`);
+        });
+      }
+    }
+  }, [useDeepgram, isListening, cleanupDeepgram, initDeepgramRecognizer, appendDebug]);
 
   const stopRecording = useCallback(() => {
     if (!isRecordingRef.current) return;
@@ -1632,7 +1677,7 @@ export default function App() {
       visualization.stopVisualization();
       visualization.resetCalibration();
       if (Capacitor.isNativePlatform()) {
-        ForegroundService.stop().catch(console.warn);
+        ForegroundService.stopForegroundService().catch(console.warn);
       }
       setIsListening(false); isListeningRef.current = false;
       setIsRecording(false);
@@ -1828,7 +1873,6 @@ export default function App() {
             // Also add transcript window (cross-phrase detection) - Use bounded queue
             const boundedTranscript = combined.trim();
             transcriptQueueRef.current.push(boundedTranscript);
-            if (transcriptQueueRef.current.length > 10) transcriptQueueRef.current.shift();
             const windowJoined = transcriptQueueRef.current.join(' ');
             hyps.push({ transcript: windowJoined, confidence: 0.7 });
 
@@ -1879,11 +1923,7 @@ export default function App() {
         
         if (Capacitor.isNativePlatform()) {
           requestBatteryOptimization().catch(console.warn);
-          ForegroundService.start({
-            title: 'AdMonitor Pro',
-            body: 'Monitoring radio streams in the background',
-            id: 1937,
-          }).catch(console.warn);
+          startForegroundServiceWithFallback().catch(console.warn);
         }
         toast.success('Monitoring started. Calibrating noise floor…');
 
@@ -1928,7 +1968,7 @@ export default function App() {
         }
       });
     }
-  }, [requestMicrophoneStream, startVisualiser, saveRecording, triggerRecording, refreshGrammar, appendDebug, cleanupVosk, cleanupDeepgram, evaluateTranscriptSource, initVoskRecognizer, initDeepgramRecognizer]);
+  }, [requestMicrophoneStream, startVisualiser, saveRecording, triggerRecording, refreshGrammar, appendDebug, cleanupVosk, cleanupDeepgram, evaluateTranscriptSource, initVoskRecognizer, initDeepgramRecognizer, startForegroundServiceWithFallback]);
 
   // ── Keyword management ────────────────────────────────────────────────────
   const addKeyword = async (e: React.FormEvent) => {
@@ -2480,10 +2520,19 @@ export default function App() {
 
                 <div>
                   <label className="block text-xs font-medium text-zinc-400 mb-2">Cloud ASR (Deepgram)</label>
-                  <label className="flex items-center gap-2 text-sm text-zinc-300 cursor-pointer p-3 bg-zinc-800 rounded-xl border border-zinc-700 hover:border-zinc-600 transition-colors">
-                    <input type="checkbox" checked={useDeepgram} onChange={e=>setUseDeepgram(e.target.checked)} className="rounded accent-blue-500 w-5 h-5 min-w-[20px] min-h-[20px] shrink-0 cursor-pointer" />
-                    <span className="flex-1">Enable Deepgram Integration</span>
-                  </label>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={useDeepgram}
+                    onClick={() => setUseDeepgram(v => !v)}
+                    className="w-full flex items-center gap-3 text-zinc-300 cursor-pointer p-3 min-h-12 bg-zinc-800 rounded-xl border border-zinc-700 hover:border-zinc-600 transition-colors"
+                  >
+                    <span className={`relative inline-flex h-7 w-12 items-center rounded-full transition-colors ${useDeepgram ? 'bg-blue-600' : 'bg-zinc-600'}`}>
+                      <span className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${useDeepgram ? 'translate-x-6' : 'translate-x-1'}`} />
+                    </span>
+                    <span className="flex-1 text-left text-xs sm:text-sm leading-5">Enable Deepgram Integration</span>
+                    <span className="mono text-[10px] text-zinc-500">{useDeepgram ? 'ON' : 'OFF'}</span>
+                  </button>
                   <div className="mt-2 flex items-center justify-between text-[10px] mono">
                     <span className="text-zinc-600">Status</span>
                     <span className={deepgramStatus === 'ready' ? 'text-emerald-500' : deepgramStatus === 'loading' ? 'text-amber-400' : deepgramStatus === 'error' ? 'text-red-400' : 'text-zinc-600'}>

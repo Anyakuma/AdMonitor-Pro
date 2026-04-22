@@ -2,6 +2,7 @@ import "dotenv/config";
 import dns from "node:dns";
 import express from "express";
 import { Pool } from "pg";
+import path from "node:path";
 
 // Force Node.js to use IPv4 first. This fixes ENOTFOUND and ConnectTimeout errors
 // on local networks that lack proper IPv6 routing.
@@ -392,6 +393,11 @@ function setupRoutes() {
     }
   });
 
+  // Health check endpoint for Service Worker / PWA connectivity checks
+  app.get("/api/health", (_req, res) => {
+    res.json({ status: "ok", database: isDatabaseEnabled() ? "connected" : "disabled" });
+  });
+
 }
 
 setupRoutes();
@@ -413,6 +419,12 @@ async function startServer() {
     app.use(vite.middlewares);
   } else if (!process.env.VERCEL) {
     app.use(express.static("dist"));
+    
+    // SPA Fallback: Serve index.html for unknown routes.
+    // This is crucial for PWA Service Workers to cache the app shell and work offline.
+    app.get("*", (_req, res) => {
+      res.sendFile(path.join(process.cwd(), "dist", "index.html"));
+    });
   }
 
   if (!process.env.VERCEL) {

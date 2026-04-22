@@ -63,6 +63,19 @@ import { useVisualization } from './features/audio/hooks/useVisualization';
 import type { Confidence } from './features/detection/services/detectionService';
 import type { Recording, KeywordStat } from './features/recordings/services/recordingService';
 import * as recordingService from './features/recordings/services/recordingService';
+import { Capacitor } from '@capacitor/core';
+import { ForegroundService } from '@capawesome-team/capacitor-android-foreground-service';
+import { BatteryOptimization } from '@capawesome-team/capacitor-android-battery-optimization';
+
+const requestBatteryOptimization = async () => {
+  if (Capacitor.getPlatform() === 'android') {
+    const { isIgnoringBatteryOptimizations } = await BatteryOptimization.isIgnoringBatteryOptimizations();
+    if (!isIgnoringBatteryOptimizations) {
+      // This pops up the native Android dialog asking the user to "Allow" the app to run in the background without restrictions.
+      await BatteryOptimization.requestIgnoreBatteryOptimizations();
+    }
+  }
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types (App-specific)
@@ -741,6 +754,7 @@ export default function App() {
   const currentVoteRef    = useRef(0);
   const currentVariantRef = useRef('');
   const processorRef      = useRef<ScriptProcessorNode | null>(null);
+  const workletNodeRef    = useRef<AudioWorkletNode | null>(null);
   const recordStartRef    = useRef(0);
   const voskModelRef       = useRef<any>(null);
   const voskRecognizerRef  = useRef<any>(null);
@@ -900,6 +914,7 @@ export default function App() {
         recognitionRef.current?.stop?.();
         continuousRecRef.current?.stop?.();
         processorRef.current?.disconnect?.();
+        workletNodeRef.current?.disconnect?.();
       } catch {}
       
       try {
@@ -1071,6 +1086,21 @@ export default function App() {
       lowpass.type = 'lowpass';
       lowpass.frequency.value = 3800;
       lowpass.Q.value = 0.7;
+      
+      // Presence Boost (2500 Hz) to highlight consonants
+      const presence = ctx.createBiquadFilter();
+      presence.type = 'peaking';
+      presence.frequency.value = 2500;
+      presence.Q.value = 1.0;
+      presence.gain.value = 4.0;
+
+      // Dynamics Compressor to level volume spikes and boost quiet speech
+      const compressor = ctx.createDynamicsCompressor();
+      compressor.threshold.value = -24;
+      compressor.knee.value = 30;
+      compressor.ratio.value = 12;
+      compressor.attack.value = 0.003;
+      compressor.release.value = 0.25;
 
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 256;
@@ -1079,7 +1109,9 @@ export default function App() {
       if (filterEnabledRef.current) {
         src.connect(highpass);
         highpass.connect(lowpass);
-        lowpass.connect(analyser);
+        lowpass.connect(presence);
+        presence.connect(compressor);
+        compressor.connect(analyser);
       } else {
         src.connect(analyser);
       }
@@ -1592,12 +1624,16 @@ export default function App() {
       recognitionRef.current?.stop();
       continuousRecRef.current?.stop();
       processorRef.current?.disconnect();
+      workletNodeRef.current?.disconnect();
       streamRef.current?.getTracks().forEach(t => t.stop());
       cleanupVosk();
       cleanupDeepgram();
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
       visualization.stopVisualization();
       visualization.resetCalibration();
+      if (Capacitor.isNativePlatform()) {
+        ForegroundService.stop().catch(console.warn);
+      }
       setIsListening(false); isListeningRef.current = false;
       setIsRecording(false);
       setLiveTranscript('');
@@ -1612,7 +1648,7 @@ export default function App() {
       }
 
       // ── Mobile optimization: Adjust sample rate based on device ────
-      requestMicrophoneStream().then(stream => {
+      requestMicrophoneStream().then(async stream => {
         streamRef.current = stream;
         navigator.mediaDevices?.enumerateDevices?.()
           .then(d => setMicDevices(d.filter(device => device.kind === 'audioinput')))
@@ -1626,69 +1662,71 @@ export default function App() {
 
         // PCM circular buffer writer — uses filtered source if available
         const rawSrc = ctx.createMediaStreamSource(stream);
+        // Use a modern AudioWorklet to process audio off the main thread.
         try {
-          const proc = ctx.createScriptProcessor(2048, 1, 1);
-          const sink = ctx.createGain(); sink.gain.value = 0;
+          await ctx.audioWorklet.addModule('/audio-processor.js');
+          const workletNode = new AudioWorkletNode(ctx, 'audio-processor');
+          workletNodeRef.current = workletNode;
 
-          if (filterEnabledRef.current) {
-            // Write FILTERED audio to the circular buffer for cleaner WAV output
-            const hp = ctx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=280;
-            const lp = ctx.createBiquadFilter(); lp.type='lowpass';  lp.frequency.value=3800;
-            rawSrc.connect(hp); hp.connect(lp); lp.connect(proc);
-          } else {
-            rawSrc.connect(proc);
-          }
-          proc.connect(sink); sink.connect(ctx.destination);
-
-
-          // ⚡ PHASE 2.4: Optimize audio buffer copying - avoid allocations
-          proc.onaudioprocess = (e) => {
-            const inp = e.inputBuffer.getChannelData(0);
+          workletNode.port.onmessage = (event) => {
+            const inp = event.data as Float32Array; // Float32Array of 2048 samples
             const buf = circBufRef.current!;
             const h = writeHeadRef.current;
             const l = inp.length;
             const bl = buf.length;
             
-            // Copy to circular buffer using direct set (no temporary allocation)
             if (h + l <= bl) { 
               buf.set(inp, h); 
               writeHeadRef.current = h + l; 
             }
             else { 
-              // Wrap around: split into two copies without temporary buffers
               const f = bl - h; 
-              buf.set(inp.subarray(0, f), h);  // Set uses view, no allocation
-              buf.set(inp.subarray(f), 0);     // Set uses view, no allocation
+              buf.set(inp.subarray(0, f), h);
+              buf.set(inp.subarray(f), 0);
               writeHeadRef.current = l - f; 
             }
             
-            // For Vosk: pass buffer view directly to avoid extra Float32Array allocation
             if (voskRecognizerRef.current) {
               try {
-                // Note: Vosk.acceptWaveformFloat expects ownership semantics,
-                // so we must pass a copy. However, this is unavoidable with Vosk API.
                 voskRecognizerRef.current.acceptWaveformFloat(inp, ctx.sampleRate);
               } catch (error) {
                 console.warn('Vosk waveform accept failed', error);
               }
             }
         
-        // For Deepgram: Convert to Linear16 PCM
-        if (deepgramWsRef.current && deepgramWsRef.current.readyState === WebSocket.OPEN) {
-          try {
-            const pcmCopy = new Int16Array(inp.length);
-            for (let i = 0; i < inp.length; i++) {
-              const s = Math.max(-1, Math.min(1, inp[i]));
-              pcmCopy[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            if (deepgramWsRef.current && deepgramWsRef.current.readyState === WebSocket.OPEN) {
+              try {
+                const pcmCopy = new Int16Array(inp.length);
+                for (let i = 0; i < inp.length; i++) {
+                  const s = Math.max(-1, Math.min(1, inp[i]));
+                  pcmCopy[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+                deepgramWsRef.current.send(pcmCopy.buffer);
+              } catch (error) {
+                console.warn('Deepgram waveform send failed', error);
+              }
             }
-            deepgramWsRef.current.send(pcmCopy.buffer);
-          } catch (error) {
-            console.warn('Deepgram waveform send failed', error);
-          }
-        }
           };
-          processorRef.current = proc;
-        } catch(e) { console.warn('ScriptProcessor unavailable', e); }
+
+          const destination = ctx.createMediaStreamDestination();
+          if (filterEnabledRef.current) {
+            const hp = ctx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=280;
+            const lp = ctx.createBiquadFilter(); lp.type='lowpass';  lp.frequency.value=3800;
+            
+            // Dynamics Compressor: Levels out volume spikes and boosts quiet speech
+            const compressor = ctx.createDynamicsCompressor();
+            compressor.threshold.value = -24; // Start compressing at -24dB (catch medium/loud sounds)
+            compressor.knee.value = 30;       // Smooth transition into compression
+            compressor.ratio.value = 12;      // Aggressive broadcast-style compression
+            compressor.attack.value = 0.003;  // Very fast attack to catch sudden transients
+            compressor.release.value = 0.25;  // Natural release time for human speech
+            
+            rawSrc.connect(hp); hp.connect(lp); lp.connect(compressor); compressor.connect(workletNode);
+          } else {
+            rawSrc.connect(workletNode);
+          }
+          workletNode.connect(destination);
+        } catch(e) { console.error('AudioWorklet setup failed. This browser may not support it.', e); toast.error('Failed to initialize modern audio processor.'); }
 
         // MediaRecorder for rolling blob buffer
         const mimeType = getSupportedMimeType();
@@ -1790,6 +1828,7 @@ export default function App() {
             // Also add transcript window (cross-phrase detection) - Use bounded queue
             const boundedTranscript = combined.trim();
             transcriptQueueRef.current.push(boundedTranscript);
+            if (transcriptQueueRef.current.length > 10) transcriptQueueRef.current.shift();
             const windowJoined = transcriptQueueRef.current.join(' ');
             hyps.push({ transcript: windowJoined, confidence: 0.7 });
 
@@ -1837,6 +1876,15 @@ export default function App() {
         }
 
         setIsListening(true); isListeningRef.current = true;
+        
+        if (Capacitor.isNativePlatform()) {
+          requestBatteryOptimization().catch(console.warn);
+          ForegroundService.start({
+            title: 'AdMonitor Pro',
+            body: 'Monitoring radio streams in the background',
+            id: 1937,
+          }).catch(console.warn);
+        }
         toast.success('Monitoring started. Calibrating noise floor…');
 
       }).catch((err: any) => {
@@ -2504,6 +2552,7 @@ export default function App() {
                       <p className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">Detection Engine</p>
                       {[
                         ['Voice filter', filterEnabled ? '280–3800 Hz bandpass' : 'Disabled', filterEnabled],
+                        ['Dynamics compressor', filterEnabled ? 'Broadcast-style AGC' : 'Disabled', filterEnabled],
                         ['VAD gate', 'Adaptive RMS threshold', true],
                         ['Detector mode', detectorMode, true],
                         ['Secondary ASR', voskModelUrl ? `Vosk ${voskStatus}` : 'Not configured', voskStatus === 'ready' || !voskModelUrl],
